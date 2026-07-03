@@ -51,24 +51,46 @@ class WorldshipLabelWorkPlan:
         return tuple(s.order for s in self.steps if s.action == "print")
 
 
-def partition_worldship_label_rows(
+class WorldshipPreflightError(RuntimeError):
+    """CornerstoneMaster / vendor map checks failed before WorldShip import."""
+
+
+def _build_label_work_steps(
     orders: list["CornerstoneOrderRow"],
     vendor_maps: "VendorMapRegistry",
     *,
     build_destination,
-) -> WorldshipLabelWorkPlan:
+    errors: list[str] | None = None,
+) -> list[LabelWorkStep]:
     """
     Build label steps in CSV row order (matches WorldShip batch processing order).
 
-    SAVE rows wait for Save Print Output dialogs; PRINT rows wait for WorldShip to
-    print and advance without saving. Mixed order is allowed.
+    When ``errors`` is provided, collect row issues instead of stopping on the first
+    failure (used by preflight validation before Batch Import).
     """
     steps: list[LabelWorkStep] = []
     save_n = 0
     saw_print = False
 
     for order in orders:
-        vendor = vendor_maps.lookup(order.sku, order.retailer_key)
+        try:
+            vendor = vendor_maps.lookup(order.sku, order.retailer_key)
+        except KeyError as exc:
+            if errors is not None:
+                errors.append(
+                    f"Row {order.row_number}: {exc} "
+                    f"(retailer {order.retailer_raw!r}, PO {order.po!r})"
+                )
+                continue
+            raise
+        except (FileNotFoundError, ValueError) as exc:
+            if errors is not None:
+                errors.append(
+                    f"Row {order.row_number} (SKU {order.sku!r}): {exc}"
+                )
+                continue
+            raise
+
         label_action = is_cornerstone_warehouse_print_row(order.label_pr)
         if label_action is None:
             warehouse_print = is_warehouse_print_vendor(vendor)
@@ -107,7 +129,7 @@ def partition_worldship_label_rows(
         save_n += 1
         try:
             dest = build_destination(order, vendor_maps)
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
             if is_warehouse_print_vendor(vendor):
                 save_n -= 1
                 saw_print = True
@@ -126,6 +148,16 @@ def partition_worldship_label_rows(
                     )
                 )
                 continue
+            if errors is not None:
+                errors.append(f"Row {order.row_number}: {exc}")
+                save_n -= 1
+                continue
+            raise
+        except ValueError as exc:
+            if errors is not None:
+                errors.append(f"Row {order.row_number}: {exc}")
+                save_n -= 1
+                continue
             raise
         steps.append(
             LabelWorkStep(
@@ -137,7 +169,65 @@ def partition_worldship_label_rows(
             )
         )
 
+    return steps
+
+
+def partition_worldship_label_rows(
+    orders: list["CornerstoneOrderRow"],
+    vendor_maps: "VendorMapRegistry",
+    *,
+    build_destination,
+) -> WorldshipLabelWorkPlan:
+    """
+    Build label steps in CSV row order (matches WorldShip batch processing order).
+
+    SAVE rows wait for Save Print Output dialogs; PRINT rows wait for WorldShip to
+    print and advance without saving. Mixed order is allowed.
+    """
+    steps = _build_label_work_steps(
+        orders, vendor_maps, build_destination=build_destination
+    )
     return WorldshipLabelWorkPlan(steps=tuple(steps))
+
+
+def validate_worldship_import_preflight(
+    *,
+    build_destination,
+) -> WorldshipLabelWorkPlan:
+    """
+    Load CornerstoneMaster and validate every row before WorldShip Batch Import.
+
+    Raises WorldshipPreflightError with all row issues (missing SKU vendor map,
+    missing label folder, etc.) so the batch is not imported into WorldShip first.
+    """
+    from automation.worldship_cornerstone_master import load_cornerstone_orders
+    from automation.worldship_vendor_map import VendorMapRegistry
+    from automation.warehouse_print_vendors import load_warehouse_print_vendors
+
+    load_warehouse_print_vendors(reload=True)
+    orders = load_cornerstone_orders()
+    vendor_maps = VendorMapRegistry()
+    errors: list[str] = []
+    steps = _build_label_work_steps(
+        orders,
+        vendor_maps,
+        build_destination=build_destination,
+        errors=errors,
+    )
+    if errors:
+        lines = "\n".join(f"  • {e}" for e in errors)
+        raise WorldshipPreflightError(
+            f"CornerstoneMaster preflight failed ({len(errors)} issue(s)) — "
+            f"fix before running WorldShip import:\n{lines}"
+        )
+    plan = WorldshipLabelWorkPlan(steps=tuple(steps))
+    n_save = sum(1 for s in steps if s.action == "save")
+    n_print = sum(1 for s in steps if s.action == "print")
+    _log(
+        f"Preflight OK: {len(steps)} shipment(s) "
+        f"({n_save} SAVE, {n_print} warehouse PRINT)."
+    )
+    return plan
 
 
 def log_worldship_label_work_plan(

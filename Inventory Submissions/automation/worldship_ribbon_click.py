@@ -7,7 +7,7 @@ import re
 import time
 from typing import Callable
 
-_RIBBON_VERSION = "ribbon-click-v16"
+_RIBBON_VERSION = "ribbon-click-v17"
 _AUTO_PROCESS_LABEL_SNIPPET = "process shipments automatically"
 _BATCH_IMPORT_TITLE_SNIPPET = "batch import"
 
@@ -734,25 +734,25 @@ def ensure_import_export_tab_for_export(
     *,
     log: Callable[[str], None] | None = None,
 ) -> None:
-    """Always activate Import-Export — tab rect click first, then calibrated coordinates."""
+    """Always activate Import-Export — calibrated coordinates first, then UIA fallbacks."""
     emit = log or _log_default
     focus_main_window(win, log=emit)
     after_s = _import_pacing_s("WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 0.75, 0.15, win)
 
     emit("Export: clicking Import-Export tab…")
+    x, y = _resolve_import_export_coords(win)
+    emit(f"Export: Import-Export coordinate click at ({x}, {y})…")
+    if _physical_screen_click(x, y, win=win, log=emit, label="Import-Export tab"):
+        if after_s > 0:
+            time.sleep(after_s)
+        return
+
     if _click_import_export_tab_rect(win, log=emit):
         if after_s > 0:
             time.sleep(after_s)
         return
 
-    x, y = _resolve_import_export_coords(win)
-    emit(f"Export: Import-Export coordinate fallback at ({x}, {y})…")
-    if not _physical_screen_click(
-        x, y, win=win, log=emit, label="Import-Export tab"
-    ):
-        raise RuntimeError(f"Import-Export tab click failed at ({x}, {y})")
-    if after_s > 0:
-        time.sleep(after_s)
+    raise RuntimeError(f"Import-Export tab click failed at ({x}, {y})")
 
 
 def click_batch_export_for_export(
@@ -1206,15 +1206,14 @@ def click_ribbon(
     log: Callable[[str], None] | None = None,
 ) -> None:
     """
-    Click a WorldShip ribbon tab or button using several strategies (UIA invoke,
-    message click, Win32 child search, mouse at rect). Works better over RDP than
-    click_input() alone.
+    Click a WorldShip ribbon tab or button.
+
+    Import-Export and Batch Import use calibrated screen coordinates first; other
+    controls use UIA / Win32, then coordinate fallbacks where defined.
     """
     emit = log or _log_default
     poll_s = 0.08
-    uia_cap_s = _step_wait_s("WORLDSHIP_RIBBON_UIA_TIMEOUT_S", 2.0)
     deadline = time.monotonic() + timeout_s
-    uia_deadline = time.monotonic() + min(timeout_s, uia_cap_s)
     saw_any = False
     coord_tried = False
     focus_done = False
@@ -1250,10 +1249,10 @@ def click_ribbon(
 
     def _try_coordinate_fallback() -> bool:
         if _name_matches(title, "import-export") or _name_matches(title, "import export"):
-            emit(f"Coordinate click for Import-Export…")
+            emit("Coordinate click for Import-Export…")
             return _click_import_export_by_position(win, log=emit)
         if _name_matches(title, "batch import"):
-            emit(f"Coordinate click for Batch Import…")
+            emit("Coordinate click for Batch Import…")
             return _click_batch_import_by_position(win, log=emit)
         return False
 
@@ -1262,20 +1261,19 @@ def click_ribbon(
             focus_main_window(win, log=emit)
             focus_done = True
 
-        if _try_uia_click_once():
-            time.sleep(0.25)
-            return
-
-        now = time.monotonic()
-        if not coord_tried and now >= uia_deadline:
+        if not coord_tried:
             coord_tried = True
             if _try_coordinate_fallback():
                 time.sleep(0.25)
                 return
 
+        if _try_uia_click_once():
+            time.sleep(0.25)
+            return
+
         time.sleep(poll_s)
 
-    if not coord_tried and _try_coordinate_fallback():
+    if _try_coordinate_fallback():
         time.sleep(0.25)
         return
 
@@ -1390,9 +1388,9 @@ def _activate_import_export_tab_fast(
         return True
 
     steps: list[tuple[str, Callable[[], bool]]] = [
+        ("Import-Export coordinates", lambda: _click_import_export_tab_coords(win, log=log)),
         ("Import-Export child_window", lambda: _click_import_export_tab_child_window(win, log=log)),
         ("Import-Export Win32", lambda: _click_import_export_tab_win32(win, log=log)),
-        ("Import-Export coordinates", lambda: _click_import_export_tab_coords(win, log=log)),
     ]
 
     for name, fn in steps:
@@ -1446,6 +1444,7 @@ def _activate_import_export_tab(win, *, log: Callable[[str], None]) -> bool:
         )
 
     attempts = (
+        ("Import-Export coordinates", lambda: _click_import_export_by_position(win, log=log)),
         ("Import-Export tab rect", lambda: _click_import_export_tab_rect(win, log=log)),
         (
             "UIA Import-Export",
@@ -1458,7 +1457,6 @@ def _activate_import_export_tab(win, *, log: Callable[[str], None]) -> bool:
             )
             or True,
         ),
-        ("coordinate from Home", lambda: _click_import_export_by_position(win, log=log)),
         ("Import-Export tab rect (retry)", lambda: _click_import_export_tab_rect(win, log=log)),
     )
 
@@ -1567,16 +1565,11 @@ def click_batch_import(
         ("UIA exact", lambda: _click_batch_import_exact(win, log=emit)),
         ("UIA fuzzy", lambda: _click_batch_import_fuzzy(win, log=emit)),
     ]
-    if fast:
-        emit(
-            "Fast ribbon: Win32/child_window first, then coordinates "
-            "(Import-Export tab must be active)."
-        )
-        strategies = uia_strategies[:2] + coordinate_strategies
-    elif _running_over_rdp(win):
-        strategies = coordinate_strategies + uia_strategies
-    else:
-        strategies = uia_strategies + coordinate_strategies
+    emit(
+        "Ribbon: calibrated coordinates first, then UIA/Win32 fallbacks "
+        "(Import-Export tab must be active)."
+    )
+    strategies = coordinate_strategies + uia_strategies
 
     last_strategy = ""
     after_tab_s = _import_pacing_s(

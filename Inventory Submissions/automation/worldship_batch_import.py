@@ -1877,6 +1877,15 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     WorldShip: Import-Export → Batch Import → auto-process → preview Next →
     Smart Pickup Yes → wait for processing → save each label from CornerstoneMaster.
     """
+    from automation.worldship_label_config import processing_timeout_s
+    from automation.worldship_label_work_plan import validate_worldship_import_preflight
+
+    _log("Preflight: validating CornerstoneMaster before WorldShip import…")
+    preflight_plan = validate_worldship_import_preflight(
+        build_destination=_build_label_destination,
+    )
+    proc_timeout = processing_timeout_s(order_count=len(preflight_plan.steps) or 4)
+
     Application, _ = _require_pywinauto()
     startup_timeout_s = _startup_timeout_s()
 
@@ -1924,21 +1933,6 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     preview = _find_modal_dialog(PREVIEW_DIALOG_TITLE, timeout_s=60)
     _click_preview_next(preview)
 
-    from automation.worldship_label_config import processing_timeout_s
-
-    from automation.worldship_cornerstone_master import load_cornerstone_orders
-    from automation.worldship_label_work_plan import partition_worldship_label_rows
-    from automation.worldship_vendor_map import VendorMapRegistry
-
-    try:
-        _orders = load_cornerstone_orders()
-        _plan = partition_worldship_label_rows(
-            _orders, VendorMapRegistry(), build_destination=_build_label_destination
-        )
-        _proc_count = len(_plan.steps)
-    except Exception:
-        _proc_count = 4
-    proc_timeout = processing_timeout_s(order_count=_proc_count or 4)
     _advance_after_preview_next(processing_timeout_s=proc_timeout)
 
     labels_saved = _save_shipping_labels(app, main)
