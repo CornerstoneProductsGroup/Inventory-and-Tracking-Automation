@@ -320,14 +320,44 @@ def _wait_and_dismiss_startup_dialogs(*, timeout_s: float) -> bool:
     return clicked_any
 
 
+def _worldship_visible_win32() -> bool:
+    """Fast Win32 check — WorldShip main window is on screen (no UIA connect wait)."""
+    import win32gui
+
+    found = False
+
+    def _cb(hwnd, _):
+        nonlocal found
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = (win32gui.GetWindowText(hwnd) or "").lower()
+            if "worldship" in title or ("ups" in title and "ship" in title):
+                found = True
+                return False
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        pass
+    return found
+
+
 def _import_export_tab_ready(app, *, timeout_s: float = 2.0, fast: bool = False) -> bool:
     if _blocking_dialog_visible():
         return False
-    win_timeout = 0.4 if fast else min(3.0, timeout_s)
+    win_timeout = 0.15 if fast else min(3.0, timeout_s)
     try:
         win = app.window(title_re=WORLDSHIP_TITLE_RE)
         if not win.exists(timeout=win_timeout):
             return False
+        if fast:
+            from automation.worldship_ribbon_click import import_export_panel_active
+
+            return import_export_panel_active(win, fast=True)
         if _ribbon_action_available(
             win, "Batch Import", ("Button", "MenuItem", "SplitButton")
         ):
@@ -392,7 +422,7 @@ def _resolve_main_window(app, *, cold_start: bool):
         win = app.window(title_re=WORLDSHIP_TITLE_RE)
         _focus_main_window(win)
         if not cold_start:
-            _log("WorldShip already open — proceeding immediately.")
+            _log("WorldShip already open — Import-Export active, proceeding immediately.")
         else:
             _log("Import-Export tab is ready (no blocking dialogs).")
         return win
@@ -475,16 +505,25 @@ def _connect_or_start(app_factory, *, startup_timeout_s: float) -> tuple[object,
     backend = (os.environ.get("WORLDSHIP_UI_BACKEND") or "uia").strip() or "uia"
 
     def _connect():
-        return app_factory(backend=backend).connect(title_re=WORLDSHIP_TITLE_RE, timeout=8)
+        timeout = 1.5 if _worldship_visible_win32() else 8
+        return app_factory(backend=backend).connect(
+            title_re=WORLDSHIP_TITLE_RE, timeout=timeout
+        )
 
     try:
-        _log("Connecting to running WorldShip window…")
+        if _worldship_visible_win32():
+            _log("WorldShip window detected — connecting…")
+        else:
+            _log("Connecting to running WorldShip window…")
         app = _connect()
         _bring_worldship_to_front(app)
         if _import_export_tab_ready(app, fast=True):
-            _log("Connected — WorldShip is already loaded.")
+            _log("Connected — WorldShip is open and Import-Export is active.")
             return app, False
-        _log("Connected — WorldShip is open (brief wait for Import-Export ribbon)…")
+        if _worldship_visible_win32():
+            _log("Connected — WorldShip is already open.")
+        else:
+            _log("Connected — WorldShip is open (brief wait for Import-Export ribbon)…")
         return app, False
     except Exception:
         app = None
@@ -1892,21 +1931,40 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     app, cold_start = _connect_or_start(Application, startup_timeout_s=startup_timeout_s)
     main = _resolve_main_window(app, cold_start=cold_start)
 
-    _focus_main_window(main)
     from automation.worldship_ribbon_click import (
         _fast_ribbon_clicks_enabled,
         _import_pacing_s,
+        _worldship_already_foreground,
+        batch_import_wizard_open,
+        click_batch_import,
+        import_export_panel_active,
     )
 
-    if _fast_ribbon_clicks_enabled(main):
+    fast_ribbon = _fast_ribbon_clicks_enabled(main)
+    if fast_ribbon:
         _log("Fast import pacing enabled (calibrated ribbon / Remote Workstation).")
 
-    after_fg_s = _import_pacing_s("WORLDSHIP_AFTER_FOREGROUND_S", 1.5, 0.4, main)
-    if after_fg_s > 0:
-        _log(f"Waiting {after_fg_s:.1f}s after foreground before Import-Export tab…")
-        time.sleep(after_fg_s)
+    if not _worldship_already_foreground(main):
+        _focus_main_window(main)
 
-    from automation.worldship_ribbon_click import click_batch_import
+    ie_active = import_export_panel_active(main, fast=fast_ribbon)
+    wizard_open = batch_import_wizard_open(main, app=app)
+
+    if wizard_open:
+        _log("Batch Import wizard already open — skipping ribbon wait.")
+    elif ie_active:
+        after_fg_s = _import_pacing_s("WORLDSHIP_AFTER_FOREGROUND_S", 1.5, 0.08, main)
+        if after_fg_s > 0:
+            _log(
+                f"Import-Export already active — brief pause ({after_fg_s:.2f}s) "
+                f"before Batch Import…"
+            )
+            time.sleep(after_fg_s)
+    else:
+        after_fg_s = _import_pacing_s("WORLDSHIP_AFTER_FOREGROUND_S", 1.5, 0.4, main)
+        if after_fg_s > 0:
+            _log(f"Waiting {after_fg_s:.1f}s after foreground before Import-Export tab…")
+            time.sleep(after_fg_s)
 
     click_batch_import(main, log=_log, app=app)
 
