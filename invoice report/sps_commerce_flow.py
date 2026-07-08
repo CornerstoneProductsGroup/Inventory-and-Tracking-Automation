@@ -179,6 +179,8 @@ async def _locate_sps_bottom_search_button(page: Page):
         for sel in (
             '[data-testid="advSearchBottomSearchButton"]',
             '[data-testid*="advSearchBottomSearch" i]',
+            'button[type="submit"][title="Search"]',
+            'button[title="Search"][type="submit"]',
         ):
             loc = ctx.locator(sel).first
             try:
@@ -186,7 +188,53 @@ async def _locate_sps_bottom_search_button(page: Page):
                     return loc
             except Exception:
                 continue
+    for ctx in _contexts(page):
+        try:
+            loc = ctx.locator(
+                "button.sps-button__clickable-element[type='submit']"
+            ).filter(has_text=re.compile(r"^\s*Search\s*$", re.I)).first
+            if await _sps_locator_physically_usable(loc):
+                return loc
+        except Exception:
+            pass
+        for sel in (
+            "button[type='submit']:has-text('Search')",
+            "button[title='Search']:has-text('Search')",
+        ):
+            try:
+                loc = ctx.locator(sel).first
+                if await _sps_locator_physically_usable(loc):
+                    return loc
+            except Exception:
+                continue
     return None
+
+
+async def _sps_dismiss_open_listboxes(page: Page, log=None) -> None:
+    """
+    Close portaled MUI listboxes without Escape — repeated Escape can collapse Advanced Search.
+    """
+    dismissed = False
+    for ctx in _contexts(page):
+        try:
+            lb = ctx.locator("[role='listbox']:visible, [role='menu']:visible").first
+            if await lb.count() == 0:
+                continue
+            hdr = ctx.get_by_text(re.compile(r"Custom\s+Date\s+Range", re.I)).first
+            if await hdr.count() and await hdr.is_visible():
+                await hdr.click(timeout=2_500, force=True)
+                dismissed = True
+                break
+        except Exception:
+            continue
+    if not dismissed:
+        try:
+            await page.keyboard.press("Tab")
+        except Exception:
+            pass
+    await page.wait_for_timeout(90)
+    if dismissed and log:
+        log("SPS: dismissed open listbox (clicked away from Document Type).")
 
 
 def _looks_logged_out(url: str) -> bool:
@@ -2009,11 +2057,7 @@ async def _fill_sps_advanced_search_date_and_invoice(
     if log:
         log("SPS: setting Document Type to Invoice…")
     await _sps_select_document_type_invoice(page, doc, log=log)
-    try:
-        await page.keyboard.press("Escape")
-    except Exception:
-        pass
-    await page.wait_for_timeout(90)
+    await _sps_dismiss_open_listboxes(page, log=log)
 
 
 async def _click_sps_advanced_search_run(
@@ -2023,13 +2067,10 @@ async def _click_sps_advanced_search_run(
     Run criteria search. Uses all frames (toolbar may be in an iframe). Avoids full
     _lift_sps_ui_blockers here — its repeated Escape can disrupt the criteria strip.
     """
-    await _sps_disable_pointer_blocking_backdrops(page, log)
-    try:
-        await page.keyboard.press("Escape")
-    except Exception:
-        pass
-    await page.wait_for_timeout(90)
+    await _sps_light_transactions_form_prep(page, log)
+    await _sps_dismiss_open_listboxes(page, log=log)
     deadline = time.monotonic() + step_timeout_ms / 1000.0
+    nudge = 0
     while time.monotonic() < deadline:
         btn = await _locate_sps_bottom_search_button(page)
         if btn is not None:
@@ -2040,10 +2081,27 @@ async def _click_sps_advanced_search_run(
             try:
                 await btn.click(timeout=12_000, force=True)
             except Exception:
-                await btn.click(timeout=12_000, force=True)
+                await _sps_disable_pointer_blocking_backdrops(page, log)
+                try:
+                    await btn.click(timeout=12_000, force=True)
+                except Exception:
+                    await btn.click(timeout=12_000)
             if log:
                 log("SPS: running Advanced Search…")
             return
+        nudge += 1
+        if nudge == 1:
+            await _sps_dismiss_open_listboxes(page, log=log)
+        elif nudge % 22 == 0:
+            if log:
+                log("SPS: bottom Search not found yet; re-expanding Advanced Search…")
+            try:
+                await open_advanced_search_panel(
+                    page, step_timeout_ms=min(12_000, step_timeout_ms), log=log
+                )
+            except Exception:
+                pass
+            await _sps_light_transactions_form_prep(page, log)
         await asyncio.sleep(0.22)
     snap = await _save_sps_debug_screenshot(page, "debug_sps_search_button_missing")
     raise RuntimeError(
