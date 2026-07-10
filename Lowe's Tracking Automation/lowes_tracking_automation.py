@@ -560,29 +560,17 @@ class LowesTrackingAutomation:
         password = require_string(self.config, ["rithum", "password"])
         selectors = self.base_selectors
         delay_config = rithum.get("login_delays_ms", {})
-        delay_after_email_continue = int(delay_config.get("after_email_continue", 1200))
         delay_after_password_continue = int(delay_config.get("after_password_continue", 1200))
         delay_before_profile_selector = int(delay_config.get("before_profile_selector", 1500))
 
         page.goto(self._normalize_rithum_url(rithum["login_url"]), wait_until="domcontentloaded")
-        page.locator(selectors["username_input"]).fill(username)
-        username_continue_selector = (
-            selectors.get("username_continue_button")
-            or selectors.get("login_button")
-            or "button[type='submit']"
-        )
-        page.locator(username_continue_selector).first.click()
-        if delay_after_email_continue > 0:
-            page.wait_for_timeout(delay_after_email_continue)
 
-        page.locator(selectors["password_input"]).first.wait_for(timeout=30000)
-        page.locator(selectors["password_input"]).fill(password)
-        password_continue_selector = (
-            selectors.get("password_continue_button")
-            or selectors.get("login_button")
-            or "button[type='submit']"
-        )
-        page.locator(password_continue_selector).first.click()
+        inv = Path(__file__).resolve().parent.parent / "Inventory Submissions"
+        if inv.is_dir() and str(inv) not in sys.path:
+            sys.path.insert(0, str(inv))
+        from automation.commercehub_login import perform_commercehub_login
+
+        perform_commercehub_login(page, username, password, timeout_ms=60_000)
         if delay_after_password_continue > 0:
             page.wait_for_timeout(delay_after_password_continue)
 

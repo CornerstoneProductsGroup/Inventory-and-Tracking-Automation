@@ -401,15 +401,12 @@ async def _login(page, username: str, password: str) -> None:
     _log("Opening CommerceHub login page…")
     await page.goto(HOME_URL, wait_until="domcontentloaded")
 
-    await page.locator("#username").wait_for(state="visible", timeout=60_000)
-    _log("Entering username…")
-    await page.locator("#username").fill(username)
-    await page.locator("button._button-login-id, button[data-action-button-primary='true']").first.click()
+    _inventory = _SCRIPT_DIR.parent / "Inventory Submissions"
+    if str(_inventory) not in sys.path:
+        sys.path.insert(0, str(_inventory))
+    from automation.commercehub_login import perform_commercehub_login_async
 
-    await page.locator("#password").wait_for(state="visible", timeout=60_000)
-    _log("Entering password…")
-    await page.locator("#password").fill(password)
-    await page.locator("button._button-login-password").click()
+    await perform_commercehub_login_async(page, username, password, timeout_ms=60_000, log=_log)
 
     # Full-page redirects here destroy the JS context; do not poll locator.count() mid-navigation.
     _log("Submitted credentials; waiting for sign-in to finish (profile chooser or home)…")

@@ -1,13 +1,21 @@
 
+import sys
 import time
+from pathlib import Path
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+
+_INV = Path(__file__).resolve().parent / "Inventory Submissions"
+if _INV.is_dir() and str(_INV) not in sys.path:
+    sys.path.insert(0, str(_INV))
+
+from automation.commercehub_login import perform_commercehub_selenium_login  # noqa: E402
 
 EMAIL = "rfetzer@cornerstoneproductsgroup.com"
 PASSWORD = "Lowesdepotdepotso1106!"
@@ -79,12 +87,7 @@ def main():
     try:
         driver.get(INVOICE_URL)
 
-        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.ID, "username"))).send_keys(
-            EMAIL + Keys.RETURN
-        )
-        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.ID, "password"))).send_keys(
-            PASSWORD + Keys.RETURN
-        )
+        perform_commercehub_selenium_login(driver, EMAIL, PASSWORD)
 
         time.sleep(5)
         WebDriverWait(driver, 30).until(
