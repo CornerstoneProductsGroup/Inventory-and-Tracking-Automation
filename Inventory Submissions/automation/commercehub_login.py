@@ -6,6 +6,8 @@ Falls back to legacy Auth0 / j_username fields when present.
 """
 from __future__ import annotations
 
+import re
+import time
 from typing import Callable
 
 IDENTIFIER_INPUT_SELECTORS: tuple[str, ...] = (
@@ -55,6 +57,21 @@ LEGACY_SUBMIT_SELECTORS: tuple[str, ...] = (
     "button:has-text('Login')",
     "input[type='submit']",
 )
+
+# Post-login profile chooser (2026 MUI identity links + legacy DSM anchors).
+PROFILE_LINK_SELECTORS: tuple[str, ...] = (
+    "a[href*='handleLogin.do'][href*='identityKey=']",
+    "a[class*='_identityLink']",
+    "a.application-identity-item",
+)
+
+POST_LOGIN_READY_SELECTORS: tuple[str, ...] = PROFILE_LINK_SELECTORS + (
+    '[data-test="dsmMenu-orders"]',
+)
+
+COMMERCEHUB_HOME_READY_SELECTOR = '[data-test="dsmMenu-orders"]'
+
+DEFAULT_PROFILE_TEXT = "Cornerstone Products Group"
 
 
 def _log_msg(log: Callable[[str], None] | None, msg: str) -> None:
@@ -286,3 +303,204 @@ def perform_commercehub_selenium_login(driver, username: str, password: str, *, 
 
     sign_in = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, SELENIUM_SIGN_IN_CSS)))
     sign_in.click()
+
+
+SELENIUM_PROFILE_CSS = (
+    "a[href*='handleLogin.do'][href*='identityKey='], "
+    "a[class*='_identityLink'], a.application-identity-item"
+)
+
+
+def _profile_text_pattern(profile_text: str | None) -> re.Pattern[str] | None:
+    needle = (profile_text or "").strip()
+    if not needle:
+        return None
+    return re.compile(re.escape(needle), re.I)
+
+
+def _sync_try_profile_link(page, profile_text: str | None = None):
+    pattern = _profile_text_pattern(profile_text)
+    for sel in PROFILE_LINK_SELECTORS:
+        base = page.locator(sel)
+        candidates = [base]
+        if pattern is not None:
+            candidates.insert(0, base.filter(has_text=pattern))
+        for loc in candidates:
+            try:
+                if loc.count() == 0:
+                    continue
+                if loc.first.is_visible(timeout=400):
+                    return loc.first
+            except Exception:
+                continue
+    return None
+
+
+async def _async_try_profile_link(page, profile_text: str | None = None):
+    pattern = _profile_text_pattern(profile_text)
+    for sel in PROFILE_LINK_SELECTORS:
+        base = page.locator(sel)
+        candidates = [base]
+        if pattern is not None:
+            candidates.insert(0, base.filter(has_text=pattern))
+        for loc in candidates:
+            try:
+                if await loc.count() == 0:
+                    continue
+                if await loc.first.is_visible(timeout=400):
+                    return loc.first
+            except Exception:
+                continue
+    return None
+
+
+def _sync_on_commercehub_home(page, *, timeout_ms: int = 2_500) -> bool:
+    try:
+        page.locator(COMMERCEHUB_HOME_READY_SELECTOR).first.wait_for(
+            state="visible", timeout=timeout_ms
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _async_on_commercehub_home(page, *, timeout_ms: int = 2_500) -> bool:
+    try:
+        await page.locator(COMMERCEHUB_HOME_READY_SELECTOR).first.wait_for(
+            state="visible", timeout=timeout_ms
+        )
+        return True
+    except Exception:
+        return False
+
+
+def click_commercehub_profile(
+    page,
+    profile_text: str = DEFAULT_PROFILE_TEXT,
+    *,
+    profile_url: str | None = None,
+    timeout_ms: int = 20_000,
+    log: Callable[[str], None] | None = None,
+) -> bool:
+    """
+    Open the DSM profile after credential login. Returns True if a profile was clicked
+    or profile_url was opened; False if already on home (no chooser).
+    """
+    if profile_url:
+        _log_msg(log, "Opening CommerceHub profile via URL…")
+        page.goto(profile_url, wait_until="domcontentloaded")
+        page.wait_for_load_state("domcontentloaded")
+        return True
+
+    if _sync_on_commercehub_home(page, timeout_ms=3_000):
+        _log_msg(log, "CommerceHub home already loaded; skipping profile click.")
+        return False
+
+    _log_msg(log, f"Choosing CommerceHub profile: {profile_text!r}…")
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    profile_loc = None
+    while time.monotonic() < deadline and profile_loc is None:
+        profile_loc = _sync_try_profile_link(page, profile_text)
+        if profile_loc is None:
+            if _sync_on_commercehub_home(page, timeout_ms=800):
+                _log_msg(log, "CommerceHub home loaded while waiting for profile chooser.")
+                return False
+            page.wait_for_timeout(250)
+
+    if profile_loc is None:
+        profile_loc = _sync_try_profile_link(page, None)
+    if profile_loc is None:
+        raise RuntimeError(
+            f"CommerceHub profile chooser not found (looked for {profile_text!r}). "
+            "Set COMMERCEHUB_PROFILE_URL to the full handleLogin.do?identityKey=… link."
+        )
+
+    try:
+        profile_loc.click(timeout=min(12_000, timeout_ms))
+    except Exception:
+        profile_loc.click(timeout=min(12_000, timeout_ms), force=True)
+    page.wait_for_load_state("domcontentloaded")
+    _log_msg(log, "CommerceHub profile clicked.")
+    return True
+
+
+async def click_commercehub_profile_async(
+    page,
+    profile_text: str = DEFAULT_PROFILE_TEXT,
+    *,
+    profile_url: str | None = None,
+    timeout_ms: int = 20_000,
+    log: Callable[[str], None] | None = None,
+) -> bool:
+    """Async variant for invoice report export."""
+    if profile_url:
+        _log_msg(log, "Opening CommerceHub profile via URL…")
+        await page.goto(profile_url, wait_until="domcontentloaded")
+        await page.wait_for_load_state("domcontentloaded")
+        return True
+
+    if await _async_on_commercehub_home(page, timeout_ms=3_000):
+        _log_msg(log, "CommerceHub home already loaded; skipping profile click.")
+        return False
+
+    _log_msg(log, f"Choosing CommerceHub profile: {profile_text!r}…")
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    profile_loc = None
+    while time.monotonic() < deadline and profile_loc is None:
+        profile_loc = await _async_try_profile_link(page, profile_text)
+        if profile_loc is None:
+            if await _async_on_commercehub_home(page, timeout_ms=800):
+                _log_msg(log, "CommerceHub home loaded while waiting for profile chooser.")
+                return False
+            await page.wait_for_timeout(250)
+
+    if profile_loc is None:
+        profile_loc = await _async_try_profile_link(page, None)
+    if profile_loc is None:
+        raise RuntimeError(
+            f"CommerceHub profile chooser not found (looked for {profile_text!r}). "
+            "Set COMMERCEHUB_PROFILE_URL to the full handleLogin.do?identityKey=… link."
+        )
+
+    try:
+        await profile_loc.click(timeout=min(12_000, timeout_ms))
+    except Exception:
+        await profile_loc.click(timeout=min(12_000, timeout_ms), force=True)
+    await page.wait_for_load_state("domcontentloaded")
+    _log_msg(log, "CommerceHub profile clicked.")
+    return True
+
+
+def perform_commercehub_selenium_profile_click(
+    driver,
+    profile_text: str = DEFAULT_PROFILE_TEXT,
+    *,
+    wait_sec: int = 30,
+) -> None:
+    """Click profile row on CommerceHub identity chooser (Selenium)."""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    wait = WebDriverWait(driver, wait_sec)
+    links = wait.until(
+        EC.presence_of_all_elements_located((By.CSS_SELECTOR, SELENIUM_PROFILE_CSS))
+    )
+    needle = (profile_text or "").strip().lower()
+    chosen = None
+    for link in links:
+        try:
+            if not link.is_displayed():
+                continue
+            txt = (link.text or "").strip()
+            if not needle or needle in txt.lower():
+                chosen = link
+                break
+        except Exception:
+            continue
+    if chosen is None and links:
+        chosen = links[0]
+    if chosen is None:
+        raise RuntimeError(f"CommerceHub profile link not found for {profile_text!r}.")
+    wait.until(EC.element_to_be_clickable(chosen))
+    chosen.click()

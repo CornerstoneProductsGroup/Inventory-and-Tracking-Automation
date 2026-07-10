@@ -15,7 +15,10 @@ _INV = Path(__file__).resolve().parent / "Inventory Submissions"
 if _INV.is_dir() and str(_INV) not in sys.path:
     sys.path.insert(0, str(_INV))
 
-from automation.commercehub_login import perform_commercehub_selenium_login  # noqa: E402
+from automation.commercehub_login import (  # noqa: E402
+    perform_commercehub_selenium_login,
+    perform_commercehub_selenium_profile_click,
+)
 
 EMAIL = "rfetzer@cornerstoneproductsgroup.com"
 PASSWORD = "Lowesdepotdepotso1106!"
@@ -88,6 +91,9 @@ def main():
         driver.get(INVOICE_URL)
 
         perform_commercehub_selenium_login(driver, EMAIL, PASSWORD)
+
+        time.sleep(2)
+        perform_commercehub_selenium_profile_click(driver)
 
         time.sleep(5)
         WebDriverWait(driver, 30).until(

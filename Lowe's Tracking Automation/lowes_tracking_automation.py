@@ -568,22 +568,30 @@ class LowesTrackingAutomation:
         inv = Path(__file__).resolve().parent.parent / "Inventory Submissions"
         if inv.is_dir() and str(inv) not in sys.path:
             sys.path.insert(0, str(inv))
-        from automation.commercehub_login import perform_commercehub_login
+        from automation.commercehub_login import (
+            DEFAULT_PROFILE_TEXT,
+            click_commercehub_profile,
+            perform_commercehub_login,
+        )
 
         perform_commercehub_login(page, username, password, timeout_ms=60_000)
         if delay_after_password_continue > 0:
             page.wait_for_timeout(delay_after_password_continue)
 
-        profile_selector = (selectors.get("profile_selector") or "").strip()
-        if profile_selector:
-            try:
-                if delay_before_profile_selector > 0:
-                    page.wait_for_timeout(delay_before_profile_selector)
-                page.locator(profile_selector).first.wait_for(timeout=20000)
-                page.locator(profile_selector).first.click()
-            except Exception:
-                # Continue if profile selector does not appear for this login.
-                pass
+        if delay_before_profile_selector > 0:
+            page.wait_for_timeout(delay_before_profile_selector)
+        profile_text = (selectors.get("profile_text") or DEFAULT_PROFILE_TEXT).strip()
+        profile_url = (rithum.get("profile_url") or "").strip() or None
+        try:
+            click_commercehub_profile(
+                page,
+                profile_text,
+                profile_url=profile_url,
+                timeout_ms=20_000,
+            )
+        except Exception:
+            # Continue if profile chooser does not appear for this login.
+            pass
         self._wait_for_commercehub_logged_in(page, selectors)
         print("Logged into Rithum.")
 

@@ -18,7 +18,10 @@ _INV = Path(__file__).resolve().parent / "Inventory Submissions"
 if _INV.is_dir() and str(_INV) not in sys.path:
     sys.path.insert(0, str(_INV))
 
-from automation.commercehub_login import perform_commercehub_selenium_login  # noqa: E402
+from automation.commercehub_login import (  # noqa: E402
+    perform_commercehub_selenium_login,
+    perform_commercehub_selenium_profile_click,
+)
 from automation.ups_tracking_csv import (  # noqa: E402
     iter_po_tracking_rows,
     resolve_ups_tracking_csv_path,
@@ -247,7 +250,7 @@ def main():
     try:
         driver.get(ORDER_URL)
         perform_commercehub_selenium_login(driver, EMAIL, PASSWORD)
-        WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.CLASS_NAME, "application-identity-item"))).click()
+        perform_commercehub_selenium_profile_click(driver)
 
         for page_num in range(1, MAX_SHIP_PAGES + 1):
             result = process_page(driver, tracking_dict)

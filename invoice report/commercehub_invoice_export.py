@@ -394,7 +394,11 @@ def _env_first(*names: str) -> str:
     )
 
 
-_POST_LOGIN_SELECTOR = 'a.application-identity-item, [data-test="dsmMenu-orders"]'
+_POST_LOGIN_SELECTOR = (
+    "a[href*='handleLogin.do'][href*='identityKey='], "
+    "a[class*='_identityLink'], a.application-identity-item, "
+    '[data-test="dsmMenu-orders"]'
+)
 
 
 async def _login(page, username: str, password: str) -> None:
@@ -421,7 +425,17 @@ async def _login(page, username: str, password: str) -> None:
         ) from None
 
     home_shell = page.locator('[data-test="dsmMenu-orders"]').first
-    profile_row = page.locator("a.application-identity-item").first
+    from automation.commercehub_login import PROFILE_LINK_SELECTORS
+
+    profile_row = page.locator(PROFILE_LINK_SELECTORS[0]).first
+    for sel in PROFILE_LINK_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                profile_row = loc
+                break
+        except Exception:
+            continue
     try:
         await profile_row.wait_for(state="visible", timeout=3_000)
         _log("Sign-in complete: profile chooser is visible.")
@@ -431,57 +445,52 @@ async def _login(page, username: str, password: str) -> None:
 
 
 async def _pick_profile(page, profile_text: str, profile_url: str | None) -> None:
+    _inventory = _SCRIPT_DIR.parent / "Inventory Submissions"
+    if str(_inventory) not in sys.path:
+        sys.path.insert(0, str(_inventory))
+    from automation.commercehub_login import click_commercehub_profile_async
+
     if profile_url:
         _log("Opening profile via COMMERCEHUB_PROFILE_URL")
-        await page.goto(profile_url, wait_until="domcontentloaded")
-        await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        await page.locator('[data-test="dsmMenu-orders"]').first.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
+        await click_commercehub_profile_async(
+            page, profile_text, profile_url=profile_url, timeout_ms=NAV_TIMEOUT_MS, log=_log
+        )
+        await page.locator('[data-test="dsmMenu-orders"]').first.wait_for(
+            state="visible", timeout=NAV_TIMEOUT_MS
+        )
         return
 
     needle = profile_text.strip()
     if not needle:
         raise RuntimeError("COMMERCEHUB_PROFILE_TEXT is empty; set it or use COMMERCEHUB_PROFILE_URL.")
 
-    home_shell = page.locator('[data-test="dsmMenu-orders"]').first
-    # Search lives under Orders; the link is often hidden until the menu opens — do not use it as "home ready".
-    # Identity picker uses these anchors (see Rithum / CommerceHub DSM HTML).
-    profile_link = page.locator("a.application-identity-item").filter(
-        has_text=re.compile(re.escape(needle), re.I)
-    )
-
     _log("Choosing DSM profile (skip if already on home)…")
     try:
-        await home_shell.wait_for(state="visible", timeout=5_000)
+        clicked = await click_commercehub_profile_async(
+            page, needle, timeout_ms=NAV_TIMEOUT_MS, log=_log
+        )
+    except Exception:
+        snap = Path(__file__).resolve().parent / "debug_profile_timeout.png"
+        await page.screenshot(path=str(snap), full_page=True)
+        raise RuntimeError(
+            f"Could not find profile row matching {needle!r}. Screenshot: {snap}. "
+            "Set COMMERCEHUB_PROFILE_URL to the full handleLogin.do?identityKey=… link."
+        ) from None
+
+    if not clicked:
         _log("Already on home; no profile click needed.")
         return
-    except PlaywrightTimeout:
-        pass
 
+    home_shell = page.locator('[data-test="dsmMenu-orders"]').first
     try:
-        await profile_link.first.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
+        await home_shell.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
     except PlaywrightTimeout:
-        try:
-            await home_shell.wait_for(state="visible", timeout=5_000)
-            _log("Home loaded while waiting for profile row; no profile click needed.")
-            return
-        except PlaywrightTimeout:
-            snap = Path(__file__).resolve().parent / "debug_profile_timeout.png"
-            await page.screenshot(path=str(snap), full_page=True)
-            raise RuntimeError(
-                f"Could not find profile row matching {needle!r}. Screenshot: {snap}. "
-                "Set COMMERCEHUB_PROFILE_URL to the full handleLogin.do?identityKey=… link."
-            ) from None
-
-    _log(f"Clicking profile match for: {needle!r}")
-    try:
-        await profile_link.first.click()
-    except PlaywrightError as e:
-        if "Execution context was destroyed" not in str(e) and "navigation" not in str(e).lower():
-            raise
-        _log("Navigation after profile click; waiting for home…")
-
-    await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
-    await home_shell.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
+        snap = Path(__file__).resolve().parent / "debug_profile_timeout.png"
+        await page.screenshot(path=str(snap), full_page=True)
+        raise RuntimeError(
+            f"Profile was clicked but home menu did not load. Screenshot: {snap}"
+        ) from None
+    _log("Home shell loaded after profile click.")
     _log("Profile selected; DSM home ready.")
 
 

@@ -10,7 +10,11 @@ from automation.commercehub_timeouts import (
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-from automation.commercehub_login import perform_commercehub_login
+from automation.commercehub_login import (
+    DEFAULT_PROFILE_TEXT,
+    click_commercehub_profile,
+    perform_commercehub_login,
+)
 from automation.config import load_settings
 
 
@@ -25,6 +29,9 @@ def _save_screenshot(page, name: str) -> None:
 
 
 def _click_first_available_profile(page, timeout_ms: int) -> None:
+    if click_commercehub_profile(page, DEFAULT_PROFILE_TEXT, timeout_ms=timeout_ms):
+        return
+
     profile_candidates = [
         "button:has-text('Select')",
         "input[type='submit'][value*='Select']",
@@ -69,14 +76,7 @@ def run_rithum_inventory_on_authenticated_page(page, settings) -> None:
 
         profile_ms = rithum_profile_timeout_ms()
         try:
-            page.locator("a.application-identity-item").first.wait_for(state="visible", timeout=profile_ms)
-            profile_link = page.locator("a.application-identity-item").filter(
-                has_text="Cornerstone Products Group"
-            ).first
-            if profile_link.count() > 0 and profile_link.is_visible(timeout=min(5000, profile_ms)):
-                profile_link.click(timeout=settings.timeout_ms)
-            else:
-                _click_first_available_profile(page, settings.timeout_ms)
+            click_commercehub_profile(page, DEFAULT_PROFILE_TEXT, timeout_ms=profile_ms)
             page.wait_for_load_state("domcontentloaded")
         except Exception:
             print(
