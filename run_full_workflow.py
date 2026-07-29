@@ -594,8 +594,8 @@ def main() -> int:
         "--tracking-invoicing-only",
         action="store_true",
         help=(
-            "Skip Rithum/CommerceHub inventory and SPS inventory; run Depot/Lowe's + SPS tracking only. "
-            "Cannot be combined with --skip-commercehub."
+            "Skip Rithum/CommerceHub inventory and SPS inventory; run selected tracking lanes only. "
+            "Combine with --skip-commercehub for SPS-only tracking."
         ),
     )
     parser.add_argument(
@@ -734,8 +734,6 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    if args.tracking_invoicing_only and args.skip_commercehub:
-        parser.error("--tracking-invoicing-only cannot be combined with --skip-commercehub")
     if args.invoice_report_only and args.skip_invoice_report:
         parser.error("--invoice-report-only cannot be combined with --skip-invoice-report")
     if args.pull_orders_only and args.invoice_report_only:

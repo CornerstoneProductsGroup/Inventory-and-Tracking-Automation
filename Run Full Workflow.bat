@@ -239,11 +239,11 @@ set "EXTRA_ARGS=--skip-invoice-report --tracking-invoicing-only --skip-sps-inven
 goto RUN
 
 :TI_TRACTOR
-set "EXTRA_ARGS=--skip-invoice-report --tracking-invoicing-only --skip-commercehub --skip-grainger"
+set "EXTRA_ARGS=--skip-invoice-report --tracking-invoicing-only --skip-commercehub"
 goto RUN
 
 :TI_GRAINGER
-set "EXTRA_ARGS=--skip-invoice-report --tracking-invoicing-only --skip-commercehub --grainger-only"
+set "EXTRA_ARGS=--grainger-only"
 goto RUN
 
 :SUBMENU_INVENTORY
