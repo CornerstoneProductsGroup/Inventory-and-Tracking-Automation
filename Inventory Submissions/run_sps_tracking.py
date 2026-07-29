@@ -873,8 +873,18 @@ def open_ready_for_shipment_via_advanced_search(page: Page, *, partner_name: str
     print("STEP 1.4 done.")
 
     print("STEP 1.5: Click Search...")
+    # Re-verify both filters immediately before Search. SPS can re-mount the
+    # advanced-search controls while a multiselect is being committed.
+    ensure_partner_selected(page, partner_name)
+    ensure_workflow_shipment_selected(page, workflow_selector)
     click_advanced_search_button(page)
-    page.wait_for_load_state("domcontentloaded")
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=30_000)
+    except Exception:
+        # Advanced Search normally refreshes results through the SPA without a
+        # document navigation, so a load-state timeout is not itself an error.
+        pass
+    wait_for_partner_filtered_results(page, partner_name, timeout_ms=45_000)
     print("STEP 1.5 done.")
 
 
@@ -1673,51 +1683,127 @@ def ensure_workflow_shipment_selected(page: Page, workflow_selector: str) -> Non
 
 
 def click_advanced_search_button(page: Page) -> None:
-    # Fast path on exact selector.
+    # Click only the bottom Search button in the expanded Advanced Search form.
+    # Do not use a generic "button:has-text('Search')" fallback: the transactions
+    # header also contains document-search and Saved Search controls.
     for ctx in _contexts(page):
         loc = ctx.locator("button[data-testid='advSearchBottomSearchButton']")
-        if loc.count() == 0:
-            continue
-        try:
-            btn = loc.first
-            btn.wait_for(state="visible", timeout=1200)
-            btn.click(timeout=600)
-            print("Clicked Search via data-testid fast path.")
-            return
-        except Exception:
+        for i in range(loc.count()):
             try:
-                btn.click(timeout=600, force=True)
-                print("Clicked Search via data-testid force path.")
+                btn = loc.nth(i)
+                if not btn.is_visible():
+                    continue
+                btn.scroll_into_view_if_needed()
+                btn.click(timeout=2_000)
+                print("Clicked bottom Advanced Search button via data-testid.")
                 return
             except Exception:
-                pass
+                continue
 
     clear_click_blockers(page)
 
     selectors = [
-        "button[data-testid='advSearchBottomSearchButton']",
-        "button[data-testid='advSearchBottomSearchButton'][title='Search']",
-        "button[type='submit'][title='Search']",
-        "button:has-text('Search')",
+        (
+            "xpath=//*[contains(normalize-space(.), 'Matching Results')]"
+            "/following::button[normalize-space()='Search'][1]"
+        ),
+        (
+            "xpath=//*[contains(normalize-space(.), 'Workflows Ready For')]"
+            "/following::button[@title='Search' or normalize-space()='Search'][last()]"
+        ),
     ]
     for sel in selectors:
         for ctx in _contexts(page):
             loc = ctx.locator(sel)
-            if loc.count() == 0:
-                continue
-            try:
-                btn = loc.first
-                btn.wait_for(state="visible", timeout=2_500)
+            for i in range(loc.count()):
                 try:
-                    btn.click(timeout=1_200)
+                    btn = loc.nth(i)
+                    if not btn.is_visible():
+                        continue
+                    btn.scroll_into_view_if_needed()
+                    btn.click(timeout=2_000)
+                    print(f"Clicked bottom Advanced Search button via scoped selector: {sel}")
+                    return
                 except Exception:
-                    clear_click_blockers(page)
-                    btn.click(timeout=1_200, force=True)
-                print(f"Clicked Search via fallback selector: {sel}")
-                return
+                    continue
+    raise RuntimeError(
+        "Could not click the bottom Advanced Search 'Search' button. "
+        "Stopped rather than risk using the header/Saved Search controls."
+    )
+
+
+def _visible_result_row_texts(page: Page, *, limit: int = 8) -> list[str]:
+    """Visible transaction rows containing document links, used for partner safety checks."""
+    texts: list[str] = []
+    for ctx in _contexts(page):
+        links = ctx.locator("a[href*='/fulfillment/transactions/document/']")
+        for i in range(links.count()):
+            try:
+                link = links.nth(i)
+                if not link.is_visible():
+                    continue
+                row = link.locator("xpath=ancestor::tr[1]")
+                if row.count() == 0:
+                    row = link.locator("xpath=ancestor::*[@role='row'][1]")
+                if row.count() == 0:
+                    continue
+                text = " ".join((row.first.inner_text(timeout=1_000) or "").split())
+                if text and text not in texts:
+                    texts.append(text)
+                if len(texts) >= limit:
+                    return texts
             except Exception:
                 continue
-    raise RuntimeError("Could not click Advanced Search 'Search' button.")
+    return texts
+
+
+def wait_for_partner_filtered_results(
+    page: Page,
+    partner_name: str,
+    *,
+    timeout_ms: int = 45_000,
+) -> None:
+    """
+    Refuse to process stale/wrong-partner rows after Advanced Search.
+
+    This specifically prevents a failed Grainger search from opening Tractor
+    Supply rows and creating acknowledgments against those orders.
+    """
+    wanted = (partner_name or "").strip().lower()
+    if not wanted:
+        return
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    last_rows: list[str] = []
+    while time.monotonic() < deadline:
+        rows = _visible_result_row_texts(page)
+        if rows:
+            last_rows = rows
+            if all(wanted in row.lower() for row in rows):
+                print(
+                    f"Results verified for Partner={partner_name!r} "
+                    f"({len(rows)} visible row sample(s))."
+                )
+                return
+        else:
+            # A valid filtered search can return zero records. Accept that only
+            # when the UI explicitly reports zero matching results.
+            for ctx in _contexts(page):
+                try:
+                    zero = ctx.locator(
+                        "text=/Matching\\s+Results\\s*:\\s*0\\b/i"
+                    )
+                    if zero.count() > 0 and zero.first.is_visible():
+                        print(f"Results verified for Partner={partner_name!r}: 0 matches.")
+                        return
+                except Exception:
+                    continue
+        page.wait_for_timeout(250)
+
+    sample = " | ".join(last_rows[:3]) if last_rows else "(no result rows detected)"
+    raise RuntimeError(
+        f"Advanced Search did not produce verified {partner_name!r} results. "
+        f"Stopped before opening any order. Visible row sample: {sample}"
+    )
 
 
 def _open_next_tracked_order_from_results(
@@ -1785,8 +1871,14 @@ def _open_next_tracked_order_from_results(
     return None
 
 
-def _open_next_order_from_results(page: Page, processed_order_ids: set[str]) -> str | None:
-    """Open next visible open order from filtered results (top-down)."""
+def _open_next_order_from_results(
+    page: Page,
+    processed_order_ids: set[str],
+    *,
+    partner_name: str,
+) -> str | None:
+    """Open next visible open order for the expected partner (top-down)."""
+    wanted_partner = (partner_name or "").strip().lower()
     max_pages = 80
     for _ in range(1, max_pages + 1):
         clear_click_blockers(page)
@@ -1812,6 +1904,12 @@ def _open_next_order_from_results(page: Page, processed_order_ids: set[str]) -> 
                 if row.count() > 0:
                     try:
                         row_text = row.inner_text().strip()
+                        if wanted_partner and wanted_partner not in row_text.lower():
+                            print(
+                                f"Safety skip: result row {order_id} is not "
+                                f"Partner={partner_name!r}: {' '.join(row_text.split())}"
+                            )
+                            continue
                         if re.search(r"\bopen\b", row_text, flags=re.I) is None:
                             continue
                     except Exception:
@@ -3076,7 +3174,11 @@ def process_orders_individually(
         anchor_doc_url = ""
         open_ready_for_shipment(page, partner_name=partner_name)
         if is_grainger:
-            po = _open_next_order_from_results(page, processed_po)
+            po = _open_next_order_from_results(
+                page,
+                processed_po,
+                partner_name=partner_name,
+            )
             if po is None:
                 print("No additional open Grainger orders found in filtered transactions results.")
                 break
