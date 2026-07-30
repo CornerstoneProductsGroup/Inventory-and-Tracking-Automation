@@ -1,6 +1,7 @@
 """
 SPS Commerce (Tractor Supply path): login, fulfillment transactions, Advanced Search,
-previous-business-day filters, bulk CSV download, and save to the Tractor Supply share.
+Tractor Supply + outbound invoice + report-day filters, verified bulk CSV download,
+and save to the Tractor Supply share.
 
 Credentials and SPS_URL match the Inventory Feed project
 (`Depot and Lowe's Automation with Inventory Feed / Inventory Submissions`):
@@ -173,6 +174,24 @@ async def _locate_sps_doc_type_input(page: Page):
     return None
 
 
+async def _locate_sps_partner_input(page: Page):
+    """Partner multiselect input (main page or iframe)."""
+    for ctx in _contexts(page):
+        for sel in (
+            '[data-testid="advancedSearchPartnerMultiselect__option-list-input"]',
+            '[data-testid="advancedSearchPartnersMultiselect__option-list-input"]',
+            '[data-testid="advancedSearchTradingPartnersMultiselect__option-list-input"]',
+            'input[placeholder*="Select a Partner" i]',
+        ):
+            loc = ctx.locator(sel).first
+            try:
+                if await _sps_locator_physically_usable(loc):
+                    return loc
+            except Exception:
+                continue
+    return None
+
+
 async def _locate_sps_bottom_search_button(page: Page):
     """Advanced Search bottom-bar Search (criteria toolbar is sometimes inside an iframe)."""
     for ctx in _contexts(page):
@@ -208,6 +227,159 @@ async def _locate_sps_bottom_search_button(page: Page):
             except Exception:
                 continue
     return None
+
+
+async def _sps_filter_token_selected(page: Page, value: str) -> bool:
+    """True only for a selected tag/chip, not a transient dropdown option."""
+    wanted = re.sub(r"\s+", " ", value.strip()).lower()
+    for ctx in _contexts(page):
+        for sel in (
+            "xpath=//*[contains(@id,'_tag-')]",
+            "xpath=//*[contains(@class,'tag') or contains(@class,'chip')]",
+            "xpath=//*[contains(@class,'selected') and not(@role='option')]",
+        ):
+            try:
+                loc = ctx.locator(sel)
+                for i in range(min(await loc.count(), 40)):
+                    node = loc.nth(i)
+                    if not await node.is_visible():
+                        continue
+                    text = re.sub(r"\s+", " ", (await node.inner_text() or "").strip()).lower()
+                    if text == wanted:
+                        return True
+            except Exception:
+                continue
+    return False
+
+
+async def _sps_select_partner(
+    page: Page,
+    partner_name: str,
+    *,
+    step_timeout_ms: int,
+    log=None,
+) -> None:
+    """Select and verify the Advanced Search Partner filter."""
+    if await _sps_filter_token_selected(page, partner_name):
+        if log:
+            log(f"SPS: Partner already selected: {partner_name}.")
+        return
+
+    partner = await _locate_sps_partner_input(page)
+    if partner is None:
+        raise RuntimeError("SPS: Partner multiselect was not found in Advanced Search.")
+    await partner.wait_for(state="attached", timeout=step_timeout_ms)
+
+    # Clear selected values in this multiselect only.
+    try:
+        container = partner.locator(
+            "xpath=ancestor::*[contains(@class,'multiselect') or contains(@class,'select')][1]"
+        )
+        if await container.count():
+            remove = container.locator(
+                "button[aria-label*='Remove' i], button[title*='Remove' i], "
+                "[class*='tag'] [class*='close'], [class*='chip'] [class*='close']"
+            )
+            for _ in range(8):
+                clicked = False
+                for i in range(await remove.count()):
+                    node = remove.nth(i)
+                    try:
+                        if await node.is_visible():
+                            await node.click(timeout=2_000, force=True)
+                            await page.wait_for_timeout(80)
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not clicked:
+                    break
+    except Exception:
+        pass
+
+    if log:
+        log(f"SPS: setting Partner to {partner_name}…")
+    await partner.click(timeout=10_000, force=True)
+    try:
+        await partner.fill("")
+    except Exception:
+        pass
+    try:
+        await partner.press("Control+A")
+        await partner.press("Backspace")
+    except Exception:
+        pass
+    try:
+        await partner.press_sequentially(partner_name, delay=22)
+    except Exception:
+        await partner.fill(partner_name)
+    await page.wait_for_timeout(250)
+
+    # Prefer an option owned by this exact input, then search all contexts.
+    selected = False
+    try:
+        owns = (await partner.get_attribute("aria-owns") or "").strip()
+    except Exception:
+        owns = ""
+    if owns:
+        try:
+            opts = page.locator(f"#{owns} [role='option']")
+            for i in range(await opts.count()):
+                option = opts.nth(i)
+                text = re.sub(r"\s+", " ", (await option.inner_text() or "").strip())
+                if text.lower() == partner_name.lower() and await option.is_visible():
+                    await option.click(timeout=5_000)
+                    selected = True
+                    break
+        except Exception:
+            pass
+    if not selected:
+        for ctx in _contexts(page):
+            try:
+                option = ctx.get_by_role(
+                    "option", name=re.compile(rf"^\s*{re.escape(partner_name)}\s*$", re.I)
+                ).first
+                if await option.count() and await option.is_visible():
+                    await option.click(timeout=5_000)
+                    selected = True
+                    break
+            except Exception:
+                continue
+    if not selected:
+        raise RuntimeError(f"SPS: could not choose Partner option {partner_name!r}.")
+
+    deadline = time.monotonic() + min(step_timeout_ms, 15_000) / 1000.0
+    while time.monotonic() < deadline:
+        if await _sps_filter_token_selected(page, partner_name):
+            if log:
+                log(f"SPS: Partner confirmed as {partner_name}.")
+            return
+        await asyncio.sleep(0.2)
+    raise RuntimeError(f"SPS: Partner {partner_name!r} was not committed as a selected filter.")
+
+
+async def _sps_select_radio_filter(page: Page, label: str, *, log=None) -> None:
+    """Select and verify an Advanced Search radio such as Outbound or Exclude."""
+    for ctx in _contexts(page):
+        try:
+            radio = ctx.get_by_role(
+                "radio", name=re.compile(rf"^\s*{re.escape(label)}\s*$", re.I)
+            ).first
+            if await radio.count() == 0:
+                continue
+            if await radio.is_checked():
+                if log:
+                    log(f"SPS: radio filter already selected: {label}.")
+                return
+            await radio.click(timeout=5_000, force=True)
+            await page.wait_for_timeout(100)
+            if await radio.is_checked():
+                if log:
+                    log(f"SPS: radio filter selected: {label}.")
+                return
+        except Exception:
+            continue
+    raise RuntimeError(f"SPS: could not select/verify Advanced Search radio {label!r}.")
 
 
 async def _sps_dismiss_open_listboxes(page: Page, log=None) -> None:
@@ -1455,6 +1627,113 @@ async def _sps_wait_stable_matching_results(
     )
 
 
+async def _sps_visible_transaction_row_texts(page: Page, *, limit: int = 10) -> list[str]:
+    """Visible result rows containing transaction document links."""
+    texts: list[str] = []
+    for ctx in _contexts(page):
+        try:
+            links = ctx.locator("a[href*='/fulfillment/transactions/document/']")
+            for i in range(await links.count()):
+                link = links.nth(i)
+                if not await link.is_visible():
+                    continue
+                row = link.locator("xpath=ancestor::tr[1]")
+                if await row.count() == 0:
+                    row = link.locator("xpath=ancestor::*[@role='row'][1]")
+                if await row.count() == 0:
+                    continue
+                text = re.sub(
+                    r"\s+", " ", ((await row.first.inner_text(timeout=1_500)) or "").strip()
+                )
+                if text and text not in texts:
+                    texts.append(text)
+                if len(texts) >= limit:
+                    return texts
+        except Exception:
+            continue
+    return texts
+
+
+async def _verify_tractor_invoice_results(
+    page: Page,
+    *,
+    result_count: int,
+    report_day: date,
+    timeout_ms: int,
+    log=None,
+) -> None:
+    """
+    Hard safety gate before Select All / bulk download.
+
+    Prevents an uncommitted filter from downloading unrelated partners or
+    document types and then labeling/printing them as Tractor Supply invoices.
+    """
+    if result_count == 0:
+        return
+    partner = "tractor supply dropship"
+    date_tokens = {
+        f"{report_day.strftime('%b')} {report_day.day}, {report_day.year}".lower(),
+        f"{report_day.strftime('%B')} {report_day.day}, {report_day.year}".lower(),
+        f"{report_day.month}/{report_day.day}/{report_day.year}",
+        report_day.strftime("%m/%d/%Y"),
+    }
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    last_rows: list[str] = []
+    while time.monotonic() < deadline:
+        rows = await _sps_visible_transaction_row_texts(page)
+        if rows:
+            last_rows = rows
+            partner_ok = all(partner in row.lower() for row in rows)
+            invoice_ok = all(re.search(r"\binvoice\b", row, re.I) for row in rows)
+            date_ok = all(
+                any(token in row.lower() for token in date_tokens) for row in rows
+            )
+            if partner_ok and invoice_ok and date_ok:
+                if log:
+                    log(
+                        "SPS: result rows verified as Tractor Supply Dropship + Invoice "
+                        f"+ {report_day.isoformat()} "
+                        f"({len(rows)} visible row sample(s))."
+                    )
+                return
+        await asyncio.sleep(0.25)
+
+    sample = " | ".join(last_rows[:3]) if last_rows else "(no visible transaction rows)"
+    raise RuntimeError(
+        "SPS: Advanced Search results were not verified as Tractor Supply Dropship invoices. "
+        f"Stopped before Select All/download. Visible row sample: {sample}"
+    )
+
+
+async def _wait_for_sps_results_refresh(
+    page: Page,
+    *,
+    before_count: int | None,
+    before_rows: list[str],
+    timeout_ms: int,
+    log=None,
+) -> None:
+    """Wait for SPS's in-place result refresh so stale rows/count are never consumed."""
+    before_signature = tuple(before_rows)
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    started = time.monotonic()
+    while time.monotonic() < deadline:
+        count = await _sps_matching_results_count(page)
+        rows = await _sps_visible_transaction_row_texts(page)
+        changed = count != before_count or tuple(rows) != before_signature
+        if changed:
+            if log:
+                log("SPS: Advanced Search result set refreshed.")
+            return
+        # When the exact same query genuinely returns the same rows (including
+        # zero results), allow a conservative settle period before continuing.
+        if time.monotonic() - started >= 5.0:
+            if log:
+                log("SPS: result set unchanged after 5s; treating it as settled.")
+            return
+        await asyncio.sleep(0.25)
+
+
 async def _set_sps_text_input_value(loc, value: str, *, field_label: str) -> None:
     """Focus, fill, and if React ignores fill, assign value + dispatch input/change (common under overlays)."""
     await loc.click(timeout=10_000, force=True)
@@ -2031,6 +2310,18 @@ async def _sps_select_document_type_invoice(page: Page, doc, *, log=None) -> Non
 async def _fill_sps_advanced_search_date_and_invoice(
     page: Page, report_day: date, *, step_timeout_ms: int, log=None
 ) -> None:
+    # Scope the report before setting date/type. Without Partner, SPS returns
+    # invoices for every retailer and the postprocessor cannot distinguish them.
+    await _sps_select_partner(
+        page,
+        "Tractor Supply Dropship",
+        step_timeout_ms=step_timeout_ms,
+        log=log,
+    )
+    # Cornerstone-generated invoices are outbound. Keep archived documents out.
+    await _sps_select_radio_filter(page, "Outbound", log=log)
+    await _sps_select_radio_filter(page, "Exclude", log=log)
+
     await _lift_sps_ui_blockers(page, log)
     date_loc = await _locate_sps_custom_date_input(page)
     if date_loc is None:
@@ -2057,6 +2348,15 @@ async def _fill_sps_advanced_search_date_and_invoice(
     if log:
         log("SPS: setting Document Type to Invoice…")
     await _sps_select_document_type_invoice(page, doc, log=log)
+    deadline = time.monotonic() + min(step_timeout_ms, 15_000) / 1000.0
+    while time.monotonic() < deadline:
+        if await _sps_filter_token_selected(page, "Invoice"):
+            if log:
+                log("SPS: Document Type confirmed as Invoice.")
+            break
+        await asyncio.sleep(0.2)
+    else:
+        raise RuntimeError("SPS: Document Type Invoice was not committed as a selected filter.")
     await _sps_dismiss_open_listboxes(page, log=log)
 
 
@@ -2111,8 +2411,41 @@ async def _click_sps_advanced_search_run(
 
 
 async def _click_sps_bulk_download_cloud(page: Page) -> None:
+    """
+    Click the selected-results bottom-panel download control only.
+
+    A generic ``sps-icon-download-cloud`` selector is unsafe here because the
+    notifications tray uses the same icon for old completed exports.
+    """
     await _lift_sps_ui_blockers(page, None)
 
+    for ctx in _contexts(page):
+        for sel in (
+            'svg[data-testid="bottomPanelDownloadnBtn__download-cloud-icon"]',
+            'svg[data-testid*="bottomPanelDownload" i][data-testid*="download-cloud" i]',
+        ):
+            icon = ctx.locator(sel).first
+            try:
+                if await icon.count() == 0 or not await icon.is_visible():
+                    continue
+                button = icon.locator(
+                    "xpath=ancestor-or-self::*[self::button or @role='button'][1]"
+                ).first
+                target = button if await button.count() else icon
+                await target.scroll_into_view_if_needed()
+                await target.click(timeout=8_000, force=True)
+                return
+            except Exception:
+                continue
+    raise RuntimeError(
+        "SPS: selected-results bottom download button was not found "
+        "(expected bottomPanelDownloadnBtn__download-cloud-icon). "
+        "Stopped rather than click a notification/old-export cloud icon."
+    )
+
+    # Legacy discovery paths below are intentionally unreachable. They are
+    # retained temporarily as markup reference, but must never be used because
+    # they can resolve to a historical notification download.
     for ctx in _contexts(page):
         icon = ctx.locator("i.sps-icon.sps-icon-download-cloud").first
         try:
@@ -2355,7 +2688,10 @@ async def _maybe_confirm_combine_csv_modal(page: Page, log) -> None:
             break
         await asyncio.sleep(0.12)
     if dialog_ctx is None:
-        return
+        raise RuntimeError(
+            "SPS: Document Download modal did not appear after clicking the "
+            "selected-results bottom download button."
+        )
 
     if log:
         log("SPS: combine-documents modal — selecting one CSV file…")
@@ -2375,49 +2711,40 @@ async def _maybe_confirm_combine_csv_modal(page: Page, log) -> None:
     if container is None:
         container = dialog_ctx.locator("body")
 
+    # Select the exact Combine option. Clicking the first radio chooses
+    # "Individual CSV files" and produces the wrong download.
     clicked = False
-    for sel in (
-        "input[type='radio']",
-        "input[type='checkbox']",
-        "[role='radio']",
-        "[role='checkbox']",
-        ".sps-checkable input",
-        ".sps-checkable__input",
-    ):
-        try:
-            inp = container.locator(sel).first
-            if await inp.count() == 0:
-                continue
-            if not await inp.is_visible():
-                continue
-            await inp.scroll_into_view_if_needed()
-            try:
-                await inp.click(timeout=5_000, force=True)
-            except Exception:
-                await inp.click(timeout=5_000, force=True)
+    combine_label = container.locator("label.sps-checkable__label").filter(
+        has_text=combine_re
+    ).first
+    try:
+        if await combine_label.count() and await combine_label.is_visible():
+            await combine_label.click(timeout=5_000, force=True)
             clicked = True
-            break
-        except Exception:
-            continue
-
+    except Exception:
+        pass
     if not clicked:
-        lbl = container.locator("label.sps-checkable__label").filter(has_text=combine_re).first
         try:
-            if await lbl.count() and await lbl.is_visible():
-                await lbl.scroll_into_view_if_needed()
-                try:
-                    await lbl.click(timeout=5_000, force=True)
-                except Exception:
-                    await lbl.click(timeout=5_000, force=True)
+            radio = container.get_by_role("radio", name=combine_re).first
+            if await radio.count() and await radio.is_visible():
+                await radio.click(timeout=5_000, force=True)
                 clicked = True
         except Exception:
             pass
+
+    if not clicked:
+        raise RuntimeError(
+            "SPS: could not select 'Combine documents into one CSV file'; "
+            "stopped before creating the export."
+        )
 
     await page.wait_for_timeout(350)
 
     ok_btn = None
     for ctx in _contexts(page):
-        ob = ctx.locator('[data-testid="modalOkBtn"]').first
+        ob = ctx.locator(
+            'button[data-testid="modalOkBtn"][title="Download"]'
+        ).first
         try:
             if await ob.count() and await ob.is_visible():
                 ok_btn = ob
@@ -2425,12 +2752,17 @@ async def _maybe_confirm_combine_csv_modal(page: Page, log) -> None:
         except Exception:
             continue
     if ok_btn is None:
-        return
+        raise RuntimeError(
+            "SPS: combine-documents modal Download button was not found "
+            "(expected modalOkBtn with title Download)."
+        )
     await ok_btn.wait_for(state="visible", timeout=12_000)
     try:
         await ok_btn.click(timeout=8_000)
     except Exception:
         await ok_btn.click(timeout=8_000, force=True)
+    if log:
+        log("SPS: combined CSV export requested.")
 
 
 async def _sps_dismiss_success_download_toast(page: Page, log=None) -> None:
@@ -2468,10 +2800,15 @@ async def _sps_dismiss_success_download_toast(page: Page, log=None) -> None:
             continue
 
 
-async def _click_notifications_list_and_first_download_cloud(page: Page, log) -> None:
+async def _click_notifications_list_and_first_download_cloud(
+    page: Page,
+    log,
+    *,
+    expected_count: int,
+) -> None:
     """
     Open the header notifications / downloads tray (list icon, often with a numeric badge),
-    then trigger download on the first row that shows a cloud icon.
+    wait for the newest export with the expected transaction count, then download it.
     """
     await _sps_dismiss_success_download_toast(page, log)
     await _sps_disable_pointer_blocking_backdrops(page, log)
@@ -2546,6 +2883,57 @@ async def _click_notifications_list_and_first_download_cloud(page: Page, log) ->
     await _sps_click_through_wall_for_locator(page, target)
     await page.wait_for_timeout(900)
 
+    # The top row is newest, but also require the expected transaction count.
+    # This prevents downloading a historical Grainger export (e.g. "1 transaction").
+    count_re = re.compile(rf"\b{expected_count}\s+transactions?\b", re.I)
+    deadline = time.monotonic() + 300.0
+    while time.monotonic() < deadline:
+        matches: list[tuple[float, object]] = []
+        for ctx in _contexts(page):
+            try:
+                clouds = ctx.locator(cloud_icon_sel)
+                for i in range(await clouds.count()):
+                    cloud = clouds.nth(i)
+                    if not await cloud.is_visible():
+                        continue
+                    row = cloud.locator(
+                        "xpath=ancestor::*[self::div or self::li or self::tr]"
+                        "[contains(translate(normalize-space(.),"
+                        "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+                        "'document download')][1]"
+                    ).first
+                    if await row.count() == 0 or not await row.is_visible():
+                        continue
+                    text = re.sub(r"\s+", " ", (await row.inner_text() or "").strip())
+                    if not count_re.search(text):
+                        continue
+                    box = await row.bounding_box()
+                    y = box["y"] if box else 999999.0
+                    matches.append((y, cloud))
+            except Exception:
+                continue
+        if matches:
+            matches.sort(key=lambda item: item[0])
+            cloud = matches[0][1]
+            wrap = cloud.locator("xpath=ancestor::button[1]").first
+            click_loc = wrap if await wrap.count() else cloud
+            if log:
+                log(
+                    "SPS: newest completed export found in downloads list "
+                    f"({expected_count} transaction(s)); downloading it."
+                )
+            await _sps_click_through_wall_for_locator(page, click_loc)
+            return
+        await asyncio.sleep(0.75)
+
+    raise RuntimeError(
+        "SPS: downloads list did not show a completed export containing "
+        f"{expected_count} transaction(s) within 5 minutes. "
+        "Stopped rather than download an older notification."
+    )
+
+    # Legacy first-cloud selection below is intentionally unreachable because
+    # it can select an unrelated historical export.
     row = None
     for ctx in _contexts(page):
         try:
@@ -2651,6 +3039,7 @@ async def _download_tractor_bulk_csv(
     *,
     download_dir: Path,
     report_day: date,
+    expected_count: int,
     download_timeout_ms: int,
     log,
 ) -> Path:
@@ -2658,22 +3047,21 @@ async def _download_tractor_bulk_csv(
     await _sps_disable_pointer_blocking_backdrops(page, log)
     await _sps_wait_loading_veils_gone(page, timeout_ms=3_000)
     download_dir.mkdir(parents=True, exist_ok=True)
-    phase1 = min(90_000, max(30_000, download_timeout_ms // 8))
-    try:
-        async with page.expect_download(timeout=phase1) as di:
-            await _click_sps_bulk_download_cloud(page)
-            await _maybe_confirm_combine_csv_modal(page, log)
-        dl: Download = await di.value
-    except PlaywrightTimeout:
-        if log:
-            log(
-                f"SPS: no browser download within {phase1 // 1000}s "
-                "(queued export); completing from notifications list…"
-            )
-        rest = max(120_000, download_timeout_ms - phase1)
-        async with page.expect_download(timeout=rest) as di2:
-            await _click_notifications_list_and_first_download_cloud(page, log)
-        dl = await di2.value
+    await _click_sps_bulk_download_cloud(page)
+    await _maybe_confirm_combine_csv_modal(page, log)
+    if log:
+        log(
+            "SPS: waiting for the combined export in the internal downloads list "
+            f"({expected_count} transaction(s))…"
+        )
+    await page.wait_for_timeout(1_000)
+    async with page.expect_download(timeout=download_timeout_ms) as di:
+        await _click_notifications_list_and_first_download_cloud(
+            page,
+            log,
+            expected_count=expected_count,
+        )
+    dl: Download = await di.value
 
     dest = download_dir / f"_sps_tractor_raw_{report_day.isoformat()}.csv"
     await dl.save_as(str(dest))
@@ -2769,14 +3157,24 @@ async def run_tractor_sps_search_and_download_csv(
     await _wait_sps_advanced_search_actionable(page, timeout_ms=step_timeout, log=log)
     if log:
         log(
-            f"SPS: Advanced Search — custom date range {sps_custom_date_range_value(report_day)} "
+            "SPS: Advanced Search — Partner Tractor Supply Dropship, Direction Outbound, "
+            f"Archived Exclude, custom date range {sps_custom_date_range_value(report_day)} "
             f"(report day {report_day.isoformat()}), Document Type Invoice…"
         )
     await _fill_sps_advanced_search_date_and_invoice(
         page, report_day, step_timeout_ms=step_timeout, log=log
     )
 
+    before_count = await _sps_matching_results_count(page)
+    before_rows = await _sps_visible_transaction_row_texts(page)
     await _click_sps_advanced_search_run(page, step_timeout_ms=step_timeout, log=log)
+    await _wait_for_sps_results_refresh(
+        page,
+        before_count=before_count,
+        before_rows=before_rows,
+        timeout_ms=30_000,
+        log=log,
+    )
 
     results_timeout = min(120_000, max(60_000, nav_timeout_ms // 2))
     n = await _sps_wait_stable_matching_results(
@@ -2789,6 +3187,13 @@ async def run_tractor_sps_search_and_download_csv(
             log("SPS: no invoices for this report day — skipping download.")
         return None
 
+    await _verify_tractor_invoice_results(
+        page,
+        result_count=n,
+        report_day=report_day,
+        timeout_ms=45_000,
+        log=log,
+    )
     await _click_select_all_transactions(page, log=log)
     if log:
         log("SPS: bulk download (cloud)…")
@@ -2796,6 +3201,7 @@ async def run_tractor_sps_search_and_download_csv(
         page,
         download_dir=download_dir,
         report_day=report_day,
+        expected_count=n,
         download_timeout_ms=download_timeout_ms,
         log=log,
     )
@@ -2812,8 +3218,9 @@ async def run_sps_tractor_transactions_and_advanced_search(
     log,
 ) -> Path | None:
     """
-    New tab: SPS login → transactions list → Advanced Search → previous business day + Invoice →
-    Search → select all (if any rows) → CSV download → temp file under ``download_dir``.
+    New tab: SPS login → transactions list → Advanced Search → Partner Tractor Supply Dropship
+    + Direction Outbound + Archived Exclude + previous business day + Document Type Invoice →
+    Search → verify every visible row → select all → CSV download → temp file under ``download_dir``.
     Returns ``None`` when there are zero matching results.
     """
     download_dir = Path(download_dir).resolve()
