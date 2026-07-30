@@ -2813,11 +2813,45 @@ async def _click_notifications_list_and_first_download_cloud(
     await _sps_dismiss_success_download_toast(page, log)
     await _sps_disable_pointer_blocking_backdrops(page, log)
     await _sps_wait_loading_veils_gone(page, timeout_ms=3_000)
-    if log:
-        log("SPS: opening downloads / notifications list (top bar)…")
 
     list_icon_sel = "i.sps-icon.sps-icon-list, i.sps-icon-list"
     cloud_icon_sel = "i.sps-icon.sps-icon-download-cloud, i.sps-icon-download-cloud"
+
+    # While SPS builds the combined export, the three-line downloads control is
+    # replaced by a loading spinner. Wait for the actual list icon to return
+    # instead of treating its temporary absence as a failure.
+    if log:
+        log("SPS: waiting for downloads / notifications list to finish loading…")
+    list_ready_deadline = time.monotonic() + 300.0
+    ready_checks = 0
+    while time.monotonic() < list_ready_deadline:
+        list_icon_visible = False
+        for ctx in _contexts(page):
+            try:
+                icons = ctx.locator(list_icon_sel)
+                for i in range(await icons.count()):
+                    if await icons.nth(i).is_visible():
+                        list_icon_visible = True
+                        break
+            except Exception:
+                continue
+            if list_icon_visible:
+                break
+        if list_icon_visible:
+            ready_checks += 1
+            if ready_checks >= 2:
+                break
+        else:
+            ready_checks = 0
+        await asyncio.sleep(0.5)
+    else:
+        raise RuntimeError(
+            "SPS: downloads / notifications list did not become available "
+            "within 5 minutes after requesting the combined CSV."
+        )
+
+    if log:
+        log("SPS: downloads list is available; opening it…")
 
     target = None
     for ctx in _contexts(page):
