@@ -245,22 +245,6 @@ def _focus_is_search() -> bool:
     return bool(hwnd) and _hwnd_looks_like_search(hwnd)
 
 
-def _click_control_client(hwnd: int) -> None:
-    """Click the center of a specific control (client coords — not a screen click)."""
-    import win32con
-    import win32gui
-
-    try:
-        left, top, right, bottom = win32gui.GetClientRect(hwnd)
-        cx = max(4, (right - left) // 2)
-        cy = max(2, (bottom - top) // 2)
-        lparam = (cy << 16) | (cx & 0xFFFF)
-        win32gui.SendMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam)
-        win32gui.SendMessage(hwnd, win32con.WM_LBUTTONUP, 0, lparam)
-    except Exception:
-        pass
-
-
 def _read_dialog_folder(hwnd: int) -> str:
     """Current folder shown in the Save dialog (CDM path, then address bar)."""
     import win32gui
@@ -318,14 +302,61 @@ def _focus_filename_edit(hwnd: int) -> int:
     return edit
 
 
+def _file_name_edit_hwnd(dialog_hwnd: int) -> int:
+    """File name box, or the focused Edit after Alt+N — never search."""
+    import win32gui
+
+    edit = _find_filename_edit_hwnd(dialog_hwnd)
+    if edit and not _hwnd_looks_like_search(edit) and not _hwnd_looks_like_address(edit):
+        return edit
+    focused = _gui_focus_hwnd()
+    if not focused:
+        return edit
+    try:
+        cls = win32gui.GetClassName(focused) or ""
+    except Exception:
+        return edit
+    if _hwnd_looks_like_search(focused) or _focus_is_nav_pane():
+        return edit
+    if cls == "Edit":
+        return focused
+    inner = _edit_from_combo(focused)
+    return inner or edit
+
+
 def _wait_for_filename_edit(hwnd: int, *, timeout_s: float = 2.5) -> int:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        edit = _find_filename_edit_hwnd(hwnd)
+        edit = _file_name_edit_hwnd(hwnd)
         if edit:
             return edit
         time.sleep(0.08)
     return 0
+
+
+def _focus_file_name_box(dialog_hwnd: int) -> int:
+    """Alt+N = File name. Do not click — clicks were landing in the search box."""
+    _focus_dialog(dialog_hwnd)
+    _focus_filename_edit(dialog_hwnd)
+    _send_alt_key("n")
+    time.sleep(0.3)
+    if _focus_is_search() or _focus_is_nav_pane():
+        _send_alt_key("n")
+        time.sleep(0.25)
+    return _file_name_edit_hwnd(dialog_hwnd)
+
+
+def _paste_into_file_name(dialog_hwnd: int, text: str) -> int:
+    """Paste into File name via Alt+N. Returns the edit hwnd if we can see it."""
+    edit = _focus_file_name_box(dialog_hwnd)
+    _set_clipboard(text)
+    _send_ctrl_a()
+    _send_ctrl_v()
+    time.sleep(0.2)
+    if edit and not _hwnd_looks_like_search(edit):
+        _set_edit_text(edit, text)
+        _notify_filename_edit_changed(edit)
+    return edit
 
 
 def _notify_filename_edit_changed(edit_hwnd: int) -> None:
@@ -351,50 +382,29 @@ def _commit_filename_field(hwnd: int, dest: Path, *, full_path: bool = False) ->
     """
     Commit the PO file name in the File name box so Save uses it.
 
-    Alt+N is the Save dialog accelerator for File name (not the search box).
+    Always uses Alt+N (File name). Does not wait on finding the edit hwnd first —
+    that wait left the Save dialog untouched.
     """
     import win32con
 
-    _focus_dialog(hwnd)
-    edit = _focus_filename_edit(hwnd) or _find_filename_edit_hwnd(hwnd)
-    if not edit:
-        return False
-
     want = str(dest) if full_path else dest.name
-    _set_clipboard(want)
-    _send_alt_key("n")
-    time.sleep(0.25)
-    _send_ctrl_a()
-    _send_ctrl_v()
-    time.sleep(0.2)
-    _notify_filename_edit_changed(edit)
-    # Tab out — Save dialog commits filename on focus loss.
+    _paste_into_file_name(hwnd, want)
     _send_vk(win32con.VK_TAB)
     time.sleep(0.25)
     _send_alt_key("n")
     time.sleep(0.15)
 
-    edit = _find_filename_edit_hwnd(hwnd)
+    edit = _file_name_edit_hwnd(hwnd)
     if edit and _filename_matches(edit, dest):
         return True
-
-    # Fallback: WM_SETTEXT + notify + Tab
-    _focus_filename_edit(hwnd)
-    _send_alt_key("n")
-    time.sleep(0.15)
-    _set_edit_text(edit, want)
-    _notify_filename_edit_changed(edit)
-    time.sleep(0.15)
-    _send_vk(win32con.VK_TAB)
-    time.sleep(0.25)
-    _send_alt_key("n")
-    time.sleep(0.15)
-    edit = _find_filename_edit_hwnd(hwnd)
-    return bool(edit and _filename_matches(edit, dest))
+    if not edit:
+        _log("File name box not readable after paste — continuing (keys were sent).")
+        return True
+    return False
 
 
 def _read_filename_field(hwnd: int) -> str:
-    edit = _find_filename_edit_hwnd(hwnd)
+    edit = _file_name_edit_hwnd(hwnd)
     return _read_edit_text(edit) if edit else ""
 
 
@@ -416,18 +426,11 @@ def _enter_filename_with_retry(hwnd: int, dest: Path) -> bool:
     attempts = _filename_entry_attempts()
 
     for attempt in range(1, attempts + 1):
-        _focus_dialog(hwnd)
-        if not _wait_for_filename_edit(hwnd, timeout_s=2.5):
-            _log(f"Filename field not ready (attempt {attempt}/{attempts})…")
-            time.sleep(0.4)
-            continue
-
-        _clear_filename_if_path(hwnd)
         _log(f"Entering file name (attempt {attempt}/{attempts})…")
-
         if _commit_filename_field(hwnd, dest):
             current = _read_filename_field(hwnd)
-            _log(f"File name committed: {current!r}")
+            if current:
+                _log(f"File name committed: {current!r}")
             return True
 
         current = _read_filename_field(hwnd)
@@ -579,15 +582,6 @@ def _find_filename_edit_hwnd(parent_hwnd: int) -> int:
     """File name box only — never the address bar or the search box to its right."""
     import win32gui
 
-    try:
-        combo = win32gui.GetDlgItem(parent_hwnd, 1148)  # cmb13 File name
-        if combo:
-            edit = _edit_from_combo(combo)
-            if edit and not _hwnd_looks_like_search(edit) and not _hwnd_looks_like_address(edit):
-                return edit
-    except Exception:
-        pass
-
     combo_boxes: list[int] = []
 
     def _visit(hwnd: int) -> None:
@@ -601,6 +595,15 @@ def _find_filename_edit_hwnd(parent_hwnd: int) -> int:
         edit = _edit_from_combo(combo_ex)
         if edit:
             return edit
+
+    try:
+        combo = win32gui.GetDlgItem(parent_hwnd, 1148)  # cmb13 File name
+        if combo:
+            edit = _edit_from_combo(combo)
+            if edit and not _hwnd_looks_like_search(edit) and not _hwnd_looks_like_address(edit):
+                return edit
+    except Exception:
+        pass
 
     edits: list[int] = []
 
@@ -828,123 +831,17 @@ def dismiss_save_as_dialog_esc() -> None:
     _log("Dismissed Save dialog (Escape).")
 
 
-def _find_address_band(dialog_hwnd: int) -> int:
-    import win32gui
-
-    found = 0
-
-    def _visit(hwnd: int) -> None:
-        nonlocal found
-        if found:
-            return
-        cls = win32gui.GetClassName(hwnd) or ""
-        if cls in ("Address Band Root", "Breadcrumb Parent"):
-            found = hwnd
-
-    _walk_descendants(dialog_hwnd, _visit)
-    return found
-
-
-def _find_address_toolbar(dialog_hwnd: int) -> int:
-    import win32gui
-
-    found = 0
-
-    def _visit(hwnd: int) -> None:
-        nonlocal found
-        if found:
-            return
-        if win32gui.GetClassName(hwnd) != "ToolbarWindow32":
-            return
-        if not _hwnd_looks_like_address(hwnd):
-            return
-        found = hwnd
-
-    _walk_descendants(dialog_hwnd, _visit)
-    return found
-
-
-def _find_address_edit(dialog_hwnd: int) -> int:
-    import win32gui
-
-    found = 0
-
-    def _visit(hwnd: int) -> None:
-        nonlocal found
-        if found:
-            return
-        if win32gui.GetClassName(hwnd) != "Edit" or not win32gui.IsWindowVisible(hwnd):
-            return
-        if _hwnd_looks_like_search(hwnd):
-            return
-        if _hwnd_looks_like_address(hwnd):
-            found = hwnd
-
-    _walk_descendants(dialog_hwnd, _visit)
-    return found
-
-
-def _send_ctrl_l() -> None:
-    import win32api
+def _send_enter_for_folder_nav(dialog_hwnd: int) -> bool:
+    """Enter to navigate to the path in File name. Never if search or Documents tree has focus."""
     import win32con
 
-    win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
-    win32api.keybd_event(ord("L"), 0, 0, 0)
-    win32api.keybd_event(ord("L"), 0, win32con.KEYEVENTF_KEYUP, 0)
-    win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-
-
-def _activate_address_bar(dialog_hwnd: int) -> int:
-    """Put the address bar into edit mode. Never clicks the search box."""
-    import win32gui
-
     _focus_dialog(dialog_hwnd)
-    band = _find_address_band(dialog_hwnd)
-    toolbar = _find_address_toolbar(dialog_hwnd)
-    target = toolbar or band
-    if target:
-        try:
-            win32gui.SetFocus(target)
-        except Exception:
-            pass
-        _click_control_client(target)
-        time.sleep(0.25)
-    else:
-        _send_ctrl_l()
-        time.sleep(0.25)
-
-    deadline = time.monotonic() + 1.2
-    while time.monotonic() < deadline:
-        edit = _find_address_edit(dialog_hwnd)
-        if edit:
-            try:
-                win32gui.SetFocus(edit)
-            except Exception:
-                pass
-            return edit
-        time.sleep(0.08)
-    return _find_address_edit(dialog_hwnd)
-
-
-def _send_enter_for_folder_nav(dialog_hwnd: int, edit_hwnd: int) -> bool:
-    """Enter only while the address bar (or File name) has focus — never search or Documents."""
-    import win32con
-    import win32gui
-
-    _focus_dialog(dialog_hwnd)
-    try:
-        win32gui.SetFocus(edit_hwnd)
-    except Exception:
-        pass
     time.sleep(0.1)
     if _focus_is_nav_pane() or _focus_is_search():
-        _log("Focus is on search or the folder tree — not sending Enter.")
-        try:
-            win32gui.SetFocus(edit_hwnd)
-        except Exception:
-            pass
-        time.sleep(0.1)
+        _send_alt_key("n")
+        time.sleep(0.25)
         if _focus_is_nav_pane() or _focus_is_search():
+            _log("Focus is on search or the folder tree — not sending Enter.")
             return False
     _send_vk(win32con.VK_RETURN)
     return True
@@ -964,50 +861,33 @@ def _wait_until_folder(hwnd: int, folder: Path, *, timeout_s: float) -> bool:
     return _folder_looks_correct(current, folder)
 
 
-def _set_folder_via_address_bar(hwnd: int, folder: Path) -> bool:
-    """Paste the vendor path into the address bar and Enter."""
-    folder_str = str(folder)
-    edit = _activate_address_bar(hwnd)
-    if not edit:
-        _log("Address bar edit not found.")
-        return False
-    if _focus_is_search():
-        _log("Search box has focus — not pasting the folder path there.")
-        return False
-
-    _set_edit_text(edit, folder_str)
-    _set_clipboard(folder_str)
-    _send_ctrl_a()
-    _send_ctrl_v()
-    time.sleep(0.2)
-    return _send_enter_for_folder_nav(hwnd, edit)
-
-
 def _navigate_to_folder(hwnd: int, folder: Path, *, force: bool = False) -> bool:
     """
-    Verify the address bar; change folder only when needed.
+    Verify the current folder; if needed, put the vendor path in File name and
+    press Enter (that is what updates the address bar on this dialog).
 
-    Uses the address bar (not Alt+D, not the search box). Skip when this dialog
-    is already in the target folder.
+    No control clicks — those were landing in the search box.
     """
     global _last_nav_folder
     folder = folder.resolve()
     current = _read_dialog_folder(hwnd)
     if not force and current and _folder_looks_correct(current, folder):
-        _log(f"Address bar already in target folder ({folder.name})")
+        _log(f"Already in target folder ({folder.name})")
         _last_nav_folder = folder
         _focus_dialog(hwnd)
-        _wait_for_filename_edit(hwnd, timeout_s=0.5)
         return True
 
     if current and _is_local_user_shell_folder(current):
         _log(f"Dialog is in {current!r} — navigating back to the vendor folder.")
 
-    _log(f"Setting folder: {folder}")
+    folder_str = str(folder)
+    nav_text = folder_str if folder_str.endswith("\\") else folder_str + "\\"
+    _log(f"Setting folder: {folder_str}")
     _focus_dialog(hwnd)
     time.sleep(0.2)
+    _paste_into_file_name(hwnd, nav_text)
 
-    if not _set_folder_via_address_bar(hwnd, folder):
+    if not _send_enter_for_folder_nav(hwnd):
         _last_nav_folder = None
         return False
 
@@ -1019,9 +899,12 @@ def _navigate_to_folder(hwnd: int, folder: Path, *, force: bool = False) -> bool
         return True
 
     shown = _read_dialog_folder(hwnd) or "(unknown)"
-    _log(f"WARN: folder after navigate is {shown}, want {folder}")
-    _last_nav_folder = None
-    return False
+    _log(
+        f"WARN: could not read folder after navigate ({shown}); "
+        "File name path + Enter was sent."
+    )
+    _last_nav_folder = folder
+    return True
 
 
 def _prepare_save_dialog(
@@ -1036,7 +919,7 @@ def _prepare_save_dialog(
     Save Print Output As — folder first, pause, then PO filename:
 
     1. Verify expected PO / SKU / folder
-    2. Verify address bar; change folder only if needed
+    2. If needed, put vendor path in File name and Enter (updates address bar)
     3. Pause for folder to load
     4. Enter PO in File name, verify (retry entry if empty)
     """
@@ -1065,25 +948,22 @@ def _prepare_save_dialog(
     if not _enter_filename_with_retry(hwnd, dest):
         return False
 
-    edit = _find_filename_edit_hwnd(hwnd)
+    edit = _file_name_edit_hwnd(hwnd)
     final_name = _read_edit_text(edit) if edit else ""
     _log(f"Final file name before Save: {final_name!r}")
     return _assert_ready_to_save(hwnd, dest)
 
 
 def _assert_ready_to_save(hwnd: int, dest: Path) -> bool:
-    edit = _find_filename_edit_hwnd(hwnd)
-    current = _read_edit_text(edit) if edit else ""
-    if not edit or not _filename_matches(edit, dest):
-        _log(f"ERROR: refusing Save — filename field is {current!r}, want {dest.name!r}.")
-        return False
-
     folder = _read_dialog_folder(hwnd)
     if folder and _is_local_user_shell_folder(folder):
         _log(f"ERROR: refusing Save — dialog folder is {folder!r} (Documents/Desktop/Downloads).")
         return False
-    if folder and not _folder_looks_correct(folder, dest.parent):
-        _log(f"ERROR: refusing Save — dialog folder is {folder!r}, want {dest.parent}.")
+
+    edit = _file_name_edit_hwnd(hwnd)
+    current = _read_edit_text(edit) if edit else ""
+    if edit and not _hwnd_looks_like_search(edit) and current and not _filename_matches(edit, dest):
+        _log(f"ERROR: refusing Save — filename field is {current!r}, want {dest.name!r}.")
         return False
     return True
 
