@@ -7,6 +7,7 @@ One Playwright browser session for CommerceHub (Rithum):
 3. Home Depot quickship tracking (UPS CSV).
 4. Home Depot quickinvoice.
 5. Lowe's workflows from config (ship to store, ship to customer, invoice).
+   A missing Lowe's FedEx master skips Lowe's tracking only; invoicing and Depot continue.
 6. Home Depot Special Orders acknowledgment (thdso SKUs in vendor map), tracking + invoicing.
 
 SPS / Tractor Supply is a different site — use run_sps_lane.py or run_full_workflow.py parallel lanes.
@@ -107,7 +108,8 @@ def main() -> int:
             delays[key] = max(120, int(delays[key]) // 2)
 
         automation = LowesTrackingAutomation(config)
-        automation.load_csv_index()
+        # FedEx master is only for Lowe's tracking. Load it later so a missing
+        # file cannot abort inventory, Depot tracking/invoicing, or Special Orders.
         step_errors: list[str] = []
 
         from automation.workflow_run_report import (  # noqa: E402
@@ -197,15 +199,44 @@ def main() -> int:
                     print("\n=== Lowe's workflows skipped (--skip-lowes) ===")
                     _chain_skip("Lowe's workflows", "Disabled via --skip-lowes")
                 else:
-                    print("\n=== Lowe's workflows (all) ===")
-                    _run_step(
-                        "Lowe's workflows",
-                        lambda: automation.run_workflows_after_login(
+                    print("\n=== Lowe's workflows ===")
+
+                    def _run_lowes_workflows() -> None:
+                        tracking_ok = True
+                        try:
+                            automation.load_csv_index()
+                        except FileNotFoundError as exc:
+                            tracking_ok = False
+                            msg = (
+                                "Lowe's FedEx master not found — skipping Lowe's tracking "
+                                f"(inventory / Depot / invoicing continue): {exc}"
+                            )
+                            print(f"WARN: {msg}")
+                            step_errors.append(f"Lowe's tracking: {exc}")
+                            record_error("Lowe's tracking", str(exc))
+                            _chain_skip(
+                                "Lowe's tracking",
+                                "FedEx master file missing; Lowe's invoicing still runs",
+                            )
+                        if tracking_ok:
+                            automation.run_workflows_after_login(
+                                page,
+                                do_submit=bool(args.submit),
+                                workflow_filter="all",
+                            )
+                            return
+                        invoice_wfs = automation.get_enabled_workflows("invoice")
+                        if not invoice_wfs:
+                            print("Lowe's invoicing: no invoice workflow enabled.")
+                            return
+                        print("=== Lowe's invoicing (tracking skipped) ===")
+                        automation.run_workflows_after_login(
                             page,
                             do_submit=bool(args.submit),
-                            workflow_filter="all",
-                        ),
-                    )
+                            workflow_filter="invoice",
+                        )
+
+                    _run_step("Lowe's workflows", _run_lowes_workflows)
 
                 print("\n=== Home Depot Special Orders (acknowledge, track, invoice) ===")
                 if args.skip_special_orders:
