@@ -1144,7 +1144,7 @@ async def run_export(
             "Parallel: CommerceHub (Depot then Lowe's, one browser) + "
             "SPS Commerce / Tractor Supply (second browser)."
         )
-        (depot_path, lowes_path), tractor_path = await asyncio.gather(
+        ch_result, tractor_result = await asyncio.gather(
             _run_commercehub_invoice_browser(
                 run_depot=True,
                 run_lowes=True,
@@ -1157,8 +1157,22 @@ async def run_export(
                 headless=headless,
                 report_day=day,
             ),
+            return_exceptions=True,
         )
-        return depot_path, lowes_path, tractor_path
+        if isinstance(ch_result, BaseException):
+            if isinstance(tractor_result, BaseException):
+                _log(f"ERROR: Tractor Supply invoice report also failed: {tractor_result}")
+            elif tractor_result is not None:
+                _log(f"Tractor Supply report was saved despite CommerceHub failure: {tractor_result}")
+            raise ch_result
+        depot_path, lowes_path = ch_result
+        if isinstance(tractor_result, BaseException):
+            _log(
+                f"ERROR: Tractor Supply invoice report failed ({tractor_result}). "
+                "Depot/Lowe's reports were kept."
+            )
+            raise RuntimeError(f"Tractor Supply invoice report failed: {tractor_result}") from tractor_result
+        return depot_path, lowes_path, tractor_result
 
     if mode == "retail":
         d, l = await _run_commercehub_invoice_browser(

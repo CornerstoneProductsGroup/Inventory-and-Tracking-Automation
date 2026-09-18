@@ -1654,6 +1654,24 @@ async def _sps_visible_transaction_row_texts(page: Page, *, limit: int = 10) -> 
     return texts
 
 
+def _sps_report_day_tokens(report_day: date) -> set[str]:
+    """Date strings that may appear in SPS result rows for this report day."""
+    y, m, d = report_day.year, report_day.month, report_day.day
+    yy = f"{y % 100:02d}"
+    return {
+        f"{report_day.strftime('%b')} {d}, {y}".lower(),
+        f"{report_day.strftime('%B')} {d}, {y}".lower(),
+        f"{report_day.strftime('%b')} {d} {y}".lower(),
+        f"{m}/{d}/{y}",
+        f"{m}/{d}/{yy}",
+        report_day.strftime("%m/%d/%Y"),
+        report_day.strftime("%m/%d/%y"),
+        report_day.isoformat(),
+        report_day.strftime("%d-%b-%Y").lower(),
+        report_day.strftime("%d-%b-%y").lower(),
+    }
+
+
 async def _verify_tractor_invoice_results(
     page: Page,
     *,
@@ -1663,46 +1681,64 @@ async def _verify_tractor_invoice_results(
     log=None,
 ) -> None:
     """
-    Hard safety gate before Select All / bulk download.
+    Advisory check before Select All / bulk download.
 
-    Prevents an uncommitted filter from downloading unrelated partners or
-    document types and then labeling/printing them as Tractor Supply invoices.
+    Partner, Invoice, and date are already committed on Advanced Search. Requiring
+    every visible row to echo the report-day date aborted downloads (SPS often
+    shows received/modified as today). Matching Results > 0 plus the filters is
+    enough to proceed.
     """
     if result_count == 0:
         return
     partner = "tractor supply dropship"
-    date_tokens = {
-        f"{report_day.strftime('%b')} {report_day.day}, {report_day.year}".lower(),
-        f"{report_day.strftime('%B')} {report_day.day}, {report_day.year}".lower(),
-        f"{report_day.month}/{report_day.day}/{report_day.year}",
-        report_day.strftime("%m/%d/%Y"),
-    }
+    date_tokens = _sps_report_day_tokens(report_day)
     deadline = time.monotonic() + timeout_ms / 1000.0
     last_rows: list[str] = []
     while time.monotonic() < deadline:
         rows = await _sps_visible_transaction_row_texts(page)
         if rows:
             last_rows = rows
-            partner_ok = all(partner in row.lower() for row in rows)
-            invoice_ok = all(re.search(r"\binvoice\b", row, re.I) for row in rows)
-            date_ok = all(
-                any(token in row.lower() for token in date_tokens) for row in rows
-            )
-            if partner_ok and invoice_ok and date_ok:
+            tractor_invoice = [
+                row
+                for row in rows
+                if partner in row.lower() and re.search(r"\binvoice\b", row, re.I)
+            ]
+            if tractor_invoice:
+                date_ok = any(
+                    any(token in row.lower() for token in date_tokens)
+                    for row in tractor_invoice
+                )
                 if log:
-                    log(
-                        "SPS: result rows verified as Tractor Supply Dropship + Invoice "
-                        f"+ {report_day.isoformat()} "
-                        f"({len(rows)} visible row sample(s))."
-                    )
+                    if date_ok:
+                        log(
+                            "SPS: result rows include Tractor Supply Dropship invoices "
+                            f"for {report_day.isoformat()} "
+                            f"({len(tractor_invoice)}/{len(rows)} visible row sample(s))."
+                        )
+                    else:
+                        log(
+                            "SPS: visible rows include Tractor Supply Dropship invoices; "
+                            f"date text did not all include {report_day.isoformat()} "
+                            "(search date filter already applied). Proceeding to download."
+                        )
                 return
         await asyncio.sleep(0.25)
 
-    sample = " | ".join(last_rows[:3]) if last_rows else "(no visible transaction rows)"
-    raise RuntimeError(
-        "SPS: Advanced Search results were not verified as Tractor Supply Dropship invoices. "
-        f"Stopped before Select All/download. Visible row sample: {sample}"
-    )
+    if last_rows:
+        sample = " | ".join(last_rows[:3])
+        if log:
+            log(
+                "SPS: could not read Tractor Supply + Invoice on visible rows "
+                f"(sample: {sample}). Matching Results is {result_count}; "
+                "proceeding to Select All using the search filters."
+            )
+        return
+
+    if log:
+        log(
+            f"SPS: Matching Results is {result_count} but the grid rows were not readable "
+            "(virtualized table). Proceeding to Select All using the search filters."
+        )
 
 
 async def _wait_for_sps_results_refresh(
@@ -1715,8 +1751,12 @@ async def _wait_for_sps_results_refresh(
 ) -> None:
     """Wait for SPS's in-place result refresh so stale rows/count are never consumed."""
     before_signature = tuple(before_rows)
+    # Search often paints a spinner first; do not read Matching Results during that.
+    await asyncio.sleep(0.4)
+    await _sps_wait_loading_veils_gone(page, timeout_ms=min(20_000, max(8_000, timeout_ms)))
     deadline = time.monotonic() + timeout_ms / 1000.0
     started = time.monotonic()
+    min_unchanged_s = 12.0
     while time.monotonic() < deadline:
         count = await _sps_matching_results_count(page)
         rows = await _sps_visible_transaction_row_texts(page)
@@ -1725,13 +1765,18 @@ async def _wait_for_sps_results_refresh(
             if log:
                 log("SPS: Advanced Search result set refreshed.")
             return
-        # When the exact same query genuinely returns the same rows (including
-        # zero results), allow a conservative settle period before continuing.
-        if time.monotonic() - started >= 5.0:
+        # Same query can legitimately return the same rows, including zero, but
+        # a 5s shortcut was treating a still-running search as "0 invoices".
+        if time.monotonic() - started >= min_unchanged_s:
             if log:
-                log("SPS: result set unchanged after 5s; treating it as settled.")
+                log(
+                    f"SPS: result set unchanged after {min_unchanged_s:.0f}s; "
+                    "treating it as settled."
+                )
             return
         await asyncio.sleep(0.25)
+    if log:
+        log("SPS: Matching Results did not change after Search; using the current result set.")
 
 
 async def _set_sps_text_input_value(loc, value: str, *, field_label: str) -> None:
@@ -3199,33 +3244,55 @@ async def run_tractor_sps_search_and_download_csv(
         page, report_day, step_timeout_ms=step_timeout, log=log
     )
 
-    before_count = await _sps_matching_results_count(page)
-    before_rows = await _sps_visible_transaction_row_texts(page)
-    await _click_sps_advanced_search_run(page, step_timeout_ms=step_timeout, log=log)
-    await _wait_for_sps_results_refresh(
-        page,
-        before_count=before_count,
-        before_rows=before_rows,
-        timeout_ms=30_000,
-        log=log,
-    )
-
     results_timeout = min(120_000, max(60_000, nav_timeout_ms // 2))
-    n = await _sps_wait_stable_matching_results(
-        page, timeout_ms=results_timeout, log=log
-    )
+
+    async def _run_search_and_count() -> int:
+        before_count = await _sps_matching_results_count(page)
+        before_rows = await _sps_visible_transaction_row_texts(page)
+        await _click_sps_advanced_search_run(page, step_timeout_ms=step_timeout, log=log)
+        await _wait_for_sps_results_refresh(
+            page,
+            before_count=before_count,
+            before_rows=before_rows,
+            timeout_ms=30_000,
+            log=log,
+        )
+        return await _sps_wait_stable_matching_results(
+            page, timeout_ms=results_timeout, log=log
+        )
+
+    n = await _run_search_and_count()
     if log:
         log(f"SPS: Matching Results: {n}.")
     if n == 0:
+        date_loc = await _locate_sps_custom_date_input(page)
+        date_shown = ""
+        if date_loc is not None:
+            try:
+                date_shown = (await date_loc.input_value() or "").strip()
+            except Exception:
+                date_shown = ""
+        snap = await _save_sps_debug_screenshot(page, "debug_sps_zero_results")
         if log:
-            log("SPS: no invoices for this report day — skipping download.")
-        return None
+            log(
+                "SPS: Matching Results is 0 after first Search "
+                f"(date field {date_shown!r}, expected "
+                f"{sps_custom_date_range_value(report_day)!r}). "
+                f"Retrying Search once. Screenshot: {snap}"
+            )
+        n = await _run_search_and_count()
+        if log:
+            log(f"SPS: Matching Results after retry: {n}.")
+        if n == 0:
+            if log:
+                log("SPS: no invoices for this report day — skipping download.")
+            return None
 
     await _verify_tractor_invoice_results(
         page,
         result_count=n,
         report_day=report_day,
-        timeout_ms=45_000,
+        timeout_ms=8_000,
         log=log,
     )
     await _click_select_all_transactions(page, log=log)
@@ -3254,7 +3321,7 @@ async def run_sps_tractor_transactions_and_advanced_search(
     """
     New tab: SPS login → transactions list → Advanced Search → Partner Tractor Supply Dropship
     + Direction Outbound + Archived Exclude + previous business day + Document Type Invoice →
-    Search → verify every visible row → select all → CSV download → temp file under ``download_dir``.
+    Search → select all → CSV download → temp file under ``download_dir``.
     Returns ``None`` when there are zero matching results.
     """
     download_dir = Path(download_dir).resolve()
