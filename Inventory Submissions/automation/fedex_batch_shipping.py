@@ -3217,13 +3217,36 @@ def _download_shipment_report_xlsx(page: Page, cfg: dict[str, Any], dest: Path) 
             'Could not download "Shipment report (.xlsx file)" from the DOWNLOAD menu.'
         )
 
-    if dest.exists():
-        try:
-            dest.unlink()
-        except OSError as exc:
-            _log(f"WARN: could not remove old master file: {exc}")
+    # Write to a sidecar first, then replace. Never delete the existing master
+    # until the new report is on disk — a failed save_as used to leave the
+    # tracking folder empty, and CommerceHub tracking then had no file.
+    partial = dest.with_name(f"{dest.stem}.partial{dest.suffix}")
+    try:
+        if partial.exists():
+            partial.unlink()
+    except OSError:
+        pass
 
-    download.save_as(str(dest))
+    try:
+        download.save_as(str(partial))
+        if not partial.is_file() or partial.stat().st_size < 100:
+            raise FedexBatchError(
+                f"Shipment report download failed or file is empty: {partial}"
+            )
+        os.replace(str(partial), str(dest))
+    except Exception:
+        try:
+            if partial.is_file():
+                partial.unlink()
+        except OSError:
+            pass
+        if dest.is_file() and dest.stat().st_size >= 100:
+            _log(
+                f"WARN: new shipment report was not saved; "
+                f"kept existing {dest.name} ({dest.stat().st_size:,} bytes)."
+            )
+        raise
+
     if not dest.is_file() or dest.stat().st_size < 100:
         raise FedexBatchError(f"Shipment report download failed or file is empty: {dest}")
 
