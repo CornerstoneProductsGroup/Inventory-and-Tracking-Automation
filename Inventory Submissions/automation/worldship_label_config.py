@@ -41,6 +41,14 @@ LABEL_ROOTS: dict[str, Path] = {
         "WORLDSHIP_LABELS_TRACTOR_DIR",
         str(_PACKING_SLIPS / "6-Tractor Supply" / "1 - UPS Shipping Labels"),
     ),
+    "zoro": _p(
+        "WORLDSHIP_LABELS_ZORO_DIR",
+        str(_PACKING_SLIPS / "17-Zoro" / "1 - UPS Shipping Labels"),
+    ),
+    "grainger": _p(
+        "WORLDSHIP_LABELS_GRAINGER_DIR",
+        str(_PACKING_SLIPS / "17-Zoro" / "1 - UPS Shipping Labels"),
+    ),
 }
 
 # Legacy DFC path (PDFs saved directly under 7-DFC\<Vendor> before routing fix).
@@ -68,6 +76,10 @@ RETAILER_DAILY_LABEL_PREFIX: dict[str, str] = {
     "tractor": (
         os.environ.get("WORLDSHIP_TRACTOR_DAILY_LABEL_PREFIX") or "Tractor Supply"
     ).strip(),
+    "zoro": (os.environ.get("WORLDSHIP_ZORO_DAILY_LABEL_PREFIX") or "Zoro").strip(),
+    "grainger": (
+        os.environ.get("WORLDSHIP_GRAINGER_DAILY_LABEL_PREFIX") or "Zoro"
+    ).strip(),
 }
 
 COL_SKU = (os.environ.get("WORLDSHIP_COL_SKU") or "L").strip().upper()
@@ -89,6 +101,8 @@ RETAILER_VENDOR_MAP_FILES: dict[str, str] = {
     "thdso": "vendor_map_hd.xlsx",
     "tractor": "vendor_map_tsc.xlsx",
     "lowes": "vendor_map_lowes.xlsx",
+    "zoro": "vendor_map_zoro.xlsx",
+    "grainger": "vendor_map_zoro.xlsx",
 }
 
 _ORDER_SPLITTER_BASE = _p(
@@ -184,6 +198,8 @@ def retailer_merchant_to_key(merchant: str) -> str:
         return "dfc"
     if "tractor" in m:
         return "tractor"
+    if "zoro" in m or "grainger" in m:
+        return "zoro"
     if "homedepot" in m.replace(" ", "") or "home depot" in m or m == "depot":
         return "depot"
     raise ValueError(f"Unsupported retailer/merchant value: {merchant!r}")
