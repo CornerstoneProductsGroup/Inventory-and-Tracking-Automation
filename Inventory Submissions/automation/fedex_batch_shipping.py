@@ -1575,16 +1575,71 @@ def _row_checkbox_locator(row, cfg: dict[str, Any]):
 
 
 def _is_row_checked(row, cfg: dict[str, Any]) -> bool:
-    cb = _row_checkbox_locator(row, cfg)
+    """True only when this row's own checkbox is checked.
+
+    A hidden input elsewhere in the row can report checked while the visible
+    box is not, which used to skip the last order in a vendor group.
+    """
+    del cfg
     try:
-        if cb.count() > 0:
-            return cb.is_checked()
+        marked = row.locator(
+            "mat-checkbox.mat-mdc-checkbox-checked, "
+            ".mdc-checkbox--selected, "
+            "label[aria-checked='true'], "
+            "[role='checkbox'][aria-checked='true']"
+        )
+        if marked.count() > 0:
+            return True
     except Exception:
         pass
     try:
-        return row.locator("mat-checkbox.mat-mdc-checkbox-checked").count() > 0
+        boxes = row.locator("input[type='checkbox']")
+        for i in range(boxes.count()):
+            box = boxes.nth(i)
+            if box.is_checked():
+                return True
     except Exception:
-        return False
+        pass
+    return False
+
+
+def _scroll_row_clear_of_footer(row) -> None:
+    """Bring a shipment row into the middle of the list so the sticky Finalize bar cannot cover its checkbox."""
+    try:
+        row.scroll_into_view_if_needed(timeout=5000)
+    except Exception:
+        pass
+    try:
+        row.evaluate(
+            """(el) => {
+                el.scrollIntoView({block: 'center', inline: 'nearest'});
+                const target = el.querySelector(
+                    "label.fdx-c-form-group__label, mat-checkbox, input[type='checkbox']"
+                ) || el;
+                const rect = target.getBoundingClientRect();
+                let limit = window.innerHeight - 16;
+                for (const bar of document.querySelectorAll(
+                    'footer, [class*="toolbar"], [class*="action-bar"], [class*="bottom-bar"]'
+                )) {
+                    const box = bar.getBoundingClientRect();
+                    if (box.height < 24 || box.top < window.innerHeight * 0.5) continue;
+                    if (box.bottom >= window.innerHeight - 6) limit = Math.min(limit, box.top - 16);
+                }
+                if (rect.bottom > limit || rect.top < 80) {
+                    const delta = rect.bottom > limit ? (rect.bottom - limit + 28) : (rect.top - 140);
+                    const scroller = el.closest(
+                        '.fdx-c-table__wrapper, .fdx-c-table__scroll, .mat-mdc-table-container, [class*="scroll"]'
+                    );
+                    if (scroller && scroller.scrollHeight > scroller.clientHeight + 8) {
+                        scroller.scrollTop += delta;
+                    } else {
+                        window.scrollBy(0, delta);
+                    }
+                }
+            }"""
+        )
+    except Exception:
+        pass
 
 
 def _click_row_checkbox(
@@ -1594,10 +1649,7 @@ def _click_row_checkbox(
     *,
     ctrl_click: bool = False,
 ) -> bool:
-    try:
-        row.scroll_into_view_if_needed(timeout=5000)
-    except Exception:
-        pass
+    _scroll_row_clear_of_footer(row)
     if _is_row_checked(row, cfg):
         return True
 
@@ -1609,7 +1661,7 @@ def _click_row_checkbox(
             page.keyboard.down("Control")
         try:
             click_fn()
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(450)
             return _is_row_checked(row, cfg)
         finally:
             if ctrl_click:
@@ -1623,33 +1675,44 @@ def _click_row_checkbox(
         label = row.locator(label_sel).first
         try:
             if label.count() > 0 and label.is_visible():
-                if _do_click(lambda: label.click(timeout=8000)):
+                if _do_click(lambda label=label: label.click(timeout=8000)):
                     return True
         except Exception:
             continue
 
     cb = row.locator(cb_sel).first
     try:
-        if cb.count() > 0:
-            if not cb.is_checked():
-                if _do_click(lambda: cb.click(timeout=8000)):
-                    return True
-            return _is_row_checked(row, cfg)
+        if cb.count() > 0 and not cb.is_checked():
+            if _do_click(lambda: cb.click(timeout=8000, force=True)):
+                return True
     except Exception:
         pass
     try:
-        if ctrl_click:
-            page.keyboard.down("Control")
-        try:
-            cb.check(force=True, timeout=8000)
-        finally:
+        if _do_click(lambda: cb.check(force=True, timeout=8000)):
+            return True
+    except Exception:
+        pass
+    try:
+        target = row.locator(
+            "label.fdx-c-form-group__label, mat-checkbox, input[type='checkbox']"
+        ).first
+        box = target.bounding_box()
+        if box and box.get("width", 0) > 2 and box.get("height", 0) > 2:
             if ctrl_click:
-                page.keyboard.up("Control")
-        page.wait_for_timeout(250)
-        return _is_row_checked(row, cfg)
+                page.keyboard.down("Control")
+            try:
+                page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            finally:
+                if ctrl_click:
+                    page.keyboard.up("Control")
+            page.wait_for_timeout(450)
+            if _is_row_checked(row, cfg):
+                return True
     except Exception as exc:
         _log(f"WARN: could not check row {ref!r}: {exc}")
         return False
+    _log(f"WARN: row {ref!r} is still unchecked after click.")
+    return False
 
 
 def _find_shipment_row_for_reference(page: Page, cfg: dict[str, Any], ref: str):
@@ -1692,23 +1755,48 @@ def _count_checked_refs(page: Page, cfg: dict[str, Any], group: list[ReferenceOr
     return checked_refs
 
 
+def _group_selection_complete(
+    checked_count: int, ui_selected: int | None, expected: int
+) -> bool:
+    """Both the row checkboxes and FedEx's 'N shipments selected' must match the group."""
+    if checked_count != expected:
+        return False
+    if ui_selected is None:
+        return True
+    return ui_selected == expected
+
+
 def _select_rows_for_group(page: Page, cfg: dict[str, Any], group: list[ReferenceOrder]) -> int:
     _clear_row_selection(page, cfg)
     page.wait_for_timeout(500)
 
     expected = len(group)
+    use_ctrl = False
     for attempt in range(1, 4):
-        missing = []
-        for idx, order in enumerate(group):
+        missing: list[str] = []
+        for order in group:
             ref = order.reference
             row = _find_shipment_row_for_reference(page, cfg, ref)
             if row is None:
                 missing.append(ref)
                 continue
-            if not _click_row_checkbox(row, cfg, ref, ctrl_click=idx > 0):
+            before = _read_shipments_selected_count(page)
+            if _is_row_checked(row, cfg):
+                _log(f"  Row already checked {ref!r}")
+                continue
+            if not _click_row_checkbox(row, cfg, ref, ctrl_click=use_ctrl and before not in (None, 0)):
                 missing.append(ref)
-            else:
-                _log(f"  Checked row {ref!r}")
+                continue
+            after = _read_shipments_selected_count(page)
+            if (
+                before not in (None, 0)
+                and after == 1
+                and not use_ctrl
+            ):
+                _log("Plain checkbox click replaced the selection; retrying this group with Ctrl held.")
+                use_ctrl = True
+                break
+            _log(f"  Checked row {ref!r}")
 
         checked_refs = _count_checked_refs(page, cfg, group)
         ui_selected = _read_shipments_selected_count(page)
@@ -1717,20 +1805,22 @@ def _select_rows_for_group(page: Page, cfg: dict[str, Any], group: list[Referenc
             f"Row selection attempt {attempt}: {checked_count}/{expected} checked "
             f"(UI selected={ui_selected if ui_selected is not None else '?'})"
         )
-        if checked_count == expected and (ui_selected is None or ui_selected >= expected):
+        if _group_selection_complete(checked_count, ui_selected, expected):
             settle_ms = _after_row_select_wait_ms(cfg)
             _log(f"Waiting {settle_ms}ms for selection toolbar before Finalize…")
             page.wait_for_timeout(settle_ms)
             return expected
 
+        if ui_selected is not None and ui_selected != expected:
+            _log(
+                f"WARN: FedEx reports {ui_selected} selected, expected {expected}. "
+                "Not finalizing a partial group."
+            )
         if missing:
             _log(f"WARN: could not find/check row(s): {', '.join(missing)}")
         if attempt < 3:
+            _clear_row_selection(page, cfg)
             page.wait_for_timeout(600)
-            for order in group:
-                row = _find_shipment_row_for_reference(page, cfg, order.reference)
-                if row is not None and not _is_row_checked(row, cfg):
-                    _click_row_checkbox(row, cfg, order.reference)
 
     checked_refs = _count_checked_refs(page, cfg, group)
     checked_count = len(checked_refs)
@@ -1739,6 +1829,8 @@ def _select_rows_for_group(page: Page, cfg: dict[str, Any], group: list[Referenc
         f"Row selection final: {checked_count}/{expected} checked "
         f"(UI selected={ui_selected if ui_selected is not None else '?'})"
     )
+    if not _group_selection_complete(checked_count, ui_selected, expected):
+        return min(checked_count, ui_selected if ui_selected is not None else checked_count)
     return checked_count
 
 
@@ -3000,6 +3092,8 @@ def _process_vendor_groups(
         )
 
     pass_num = 0
+    stuck_refs: tuple[str, ...] | None = None
+    stuck_passes = 0
     while pass_num < 50:
         pass_num += 1
         states = _scan_shipment_rows(page, cfg)
@@ -3020,6 +3114,19 @@ def _process_vendor_groups(
                 "(tracking present or status printed)."
             )
             break
+
+        pending_refs = tuple(s.reference for s in pending)
+        if pending_refs == stuck_refs:
+            stuck_passes += 1
+        else:
+            stuck_refs = pending_refs
+            stuck_passes = 0
+        if stuck_passes >= 2:
+            raise FedexBatchError(
+                "Same shipment(s) are still not finalized after repeated attempts: "
+                + ", ".join(pending_refs)
+                + ". Stopped before the shipment report so tracking is not saved short."
+            )
 
         _log(f"Pass {pass_num}: {len(pending)} shipment(s) pending finalize/print.")
 
@@ -3088,6 +3195,13 @@ def _process_vendor_groups(
         else:
             _log(f"WARN: could not save label PDF for {vendor!r}")
 
+    leftover = [s.reference for s in _scan_shipment_rows(page, cfg) if not s.done]
+    if leftover:
+        raise FedexBatchError(
+            "Shipments still not finalized, so the shipment report was not saved: "
+            + ", ".join(leftover)
+        )
+
     return saved_pdfs, printed_groups, warehouse_share_paths
 
 
@@ -3113,8 +3227,24 @@ def _select_all_checkbox_selectors(cfg: dict[str, Any]) -> list[str]:
     return deduped
 
 
+def _count_checked_shipment_rows(page: Page, cfg: dict[str, Any]) -> tuple[int, int]:
+    """Return (checked rows with a PO reference, all rows with a PO reference)."""
+    row_sel = _sel(cfg, "shipment_table_row", "table tbody tr.mat-mdc-row, tr.mat-mdc-row")
+    rows = page.locator(row_sel)
+    checked = 0
+    total = 0
+    for i in range(rows.count()):
+        row = rows.nth(i)
+        if not _row_reference_text(row):
+            continue
+        total += 1
+        if _is_row_checked(row, cfg):
+            checked += 1
+    return checked, total
+
+
 def _select_all_shipment_rows(page: Page, cfg: dict[str, Any]) -> int:
-    """Select every row on the shipment list (header select-all checkbox)."""
+    """Select every row on the shipment list (header select-all, then any row it missed)."""
     _clear_row_selection(page, cfg)
     page.wait_for_timeout(300)
 
@@ -3130,49 +3260,93 @@ def _select_all_shipment_rows(page: Page, cfg: dict[str, Any]) -> int:
             else:
                 loc.click(timeout=8000)
             page.wait_for_timeout(600)
-            row_sel = _sel(cfg, "shipment_table_row", "table tbody tr.mat-mdc-row, tr.mat-mdc-row")
-            cb_sel = _sel(cfg, "row_checkbox", "input[type='checkbox']")
-            rows = page.locator(row_sel)
-            checked = 0
-            for i in range(rows.count()):
-                row = rows.nth(i)
-                if not _row_reference_text(row):
-                    continue
-                cb = row.locator(cb_sel).first
-                try:
-                    if cb.is_checked():
-                        checked += 1
-                except Exception:
-                    pass
-            if checked > 0:
+            checked, total = _count_checked_shipment_rows(page, cfg)
+            if total > 0 and checked == total:
                 _log(f"Select-all: {checked} shipment row(s) checked.")
                 return checked
+            if checked > 0:
+                _log(f"Select-all checked {checked}/{total}; filling in the rest.")
+                break
         except Exception:
             continue
 
-    raise FedexBatchError("Could not select all shipment rows (header checkbox not found).")
+    row_sel = _sel(cfg, "shipment_table_row", "table tbody tr.mat-mdc-row, tr.mat-mdc-row")
+    rows = page.locator(row_sel)
+    for i in range(rows.count()):
+        row = rows.nth(i)
+        ref = _row_reference_text(row)
+        if not ref or _is_row_checked(row, cfg):
+            continue
+        _click_row_checkbox(row, cfg, ref, ctrl_click=True)
 
+    checked, total = _count_checked_shipment_rows(page, cfg)
+    ui_selected = _read_shipments_selected_count(page)
+    if total > 0 and checked == total and (ui_selected is None or ui_selected >= total):
+        _log(f"Select-all: {checked} shipment row(s) checked.")
+        return checked
 
-def _download_menu_selectors(cfg: dict[str, Any]) -> list[str]:
-    custom = _sel(cfg, "shipment_report_menu")
-    out: list[str] = []
-    if custom:
-        out.extend(s.strip() for s in custom.split(",") if s.strip())
-    out.extend(
-        [
-            "span.mat-mdc-menu-item-text:has-text('Shipment report (.xlsx file)')",
-            ".mat-mdc-menu-item:has-text('Shipment report (.xlsx file)')",
-            "span.mat-mdc-menu-item-text:has-text('Shipment report')",
-            "button.mat-mdc-menu-item:has-text('Shipment report')",
-        ]
+    raise FedexBatchError(
+        f"Could not select every shipment row before the report "
+        f"({checked}/{total} checked, UI selected="
+        f"{ui_selected if ui_selected is not None else '?'})."
     )
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for sel in out:
-        if sel not in seen:
-            seen.add(sel)
-            deduped.append(sel)
-    return deduped
+
+
+def _dismiss_open_menu(page: Page) -> None:
+    try:
+        menu = page.locator(
+            "[role='menu']:visible, .mat-mdc-menu-panel:visible, .mat-menu-panel:visible"
+        ).first
+        if menu.count() > 0 and menu.is_visible():
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(250)
+    except Exception:
+        pass
+
+
+def _visible_shipment_report_menu_item(page: Page):
+    """The open menu row for the xlsx shipment report, not Transaction report."""
+    items = page.locator(
+        "[role='menuitem'], button.mat-mdc-menu-item, .mat-mdc-menu-item, .mat-menu-item"
+    )
+    try:
+        count = items.count()
+    except Exception:
+        return None
+    for i in range(count):
+        item = items.nth(i)
+        try:
+            if not item.is_visible():
+                continue
+            text = item.inner_text(timeout=2000) or ""
+        except Exception:
+            continue
+        if re.search(r"transaction\s+report", text, re.I):
+            continue
+        if re.search(r"shipment\s+report", text, re.I):
+            return item
+    return None
+
+
+def _open_download_menu(page: Page, cfg: dict[str, Any]) -> None:
+    if _visible_shipment_report_menu_item(page) is not None:
+        return
+    download_btn = _sel(
+        cfg,
+        "download_button",
+        (
+            "button:has-text('DOWNLOAD'), a:has-text('DOWNLOAD'), "
+            "[role='button']:has-text('DOWNLOAD'), .fdx-c-button:has-text('DOWNLOAD')"
+        ),
+    )
+    if not _click_first(page, download_btn, timeout_ms=15_000):
+        raise FedexBatchError("Could not click DOWNLOAD on the shipment list.")
+    try:
+        page.locator(
+            "[role='menu'], .mat-mdc-menu-panel, .mat-menu-panel"
+        ).first.wait_for(state="visible", timeout=8000)
+    except PlaywrightTimeout as exc:
+        raise FedexBatchError("DOWNLOAD was clicked but the report menu did not open.") from exc
 
 
 def _download_shipment_report_xlsx(page: Page, cfg: dict[str, Any], dest: Path) -> None:
@@ -3185,34 +3359,48 @@ def _download_shipment_report_xlsx(page: Page, cfg: dict[str, Any], dest: Path) 
     if selected == 0:
         raise FedexBatchError("No shipment rows to include in the report.")
 
-    download_btn = _sel(
-        cfg,
-        "download_button",
-        (
-            "button:has-text('DOWNLOAD'), a:has-text('DOWNLOAD'), "
-            "[role='button']:has-text('DOWNLOAD'), .fdx-c-button:has-text('DOWNLOAD')"
-        ),
-    )
-    if not _click_first(page, download_btn, timeout_ms=15_000):
-        raise FedexBatchError("Could not click DOWNLOAD on the shipment list.")
-
-    page.wait_for_timeout(700)
-    menu_clicked = False
-    for sel in _download_menu_selectors(cfg):
+    download = None
+    per_try_ms = min(45_000, timeout_ms)
+    for attempt in range(1, 4):
+        _dismiss_open_menu(page)
         try:
-            with page.expect_download(timeout=timeout_ms) as dl_info:
-                item = page.locator(sel).first
-                item.wait_for(state="visible", timeout=8000)
-                item.click(timeout=15_000)
+            _open_download_menu(page, cfg)
+        except FedexBatchError as exc:
+            _log(f"WARN: shipment report menu attempt {attempt}: {exc}")
+            page.wait_for_timeout(500)
+            continue
+        item = _visible_shipment_report_menu_item(page)
+        if item is None:
+            _log(
+                f"WARN: Shipment report row was not visible in the DOWNLOAD menu "
+                f"(attempt {attempt})."
+            )
+            continue
+        _log(f"Clicking Shipment report (.xlsx) (attempt {attempt})…")
+        try:
+            with page.context.expect_download(timeout=per_try_ms) as dl_info:
+                box = None
+                try:
+                    box = item.bounding_box()
+                except Exception:
+                    box = None
+                if box and box.get("width", 0) > 4 and box.get("height", 0) > 4:
+                    page.mouse.click(
+                        box["x"] + box["width"] / 2,
+                        box["y"] + box["height"] / 2,
+                    )
+                else:
+                    item.click(timeout=8000, force=True)
             download = dl_info.value
-            menu_clicked = True
             break
         except PlaywrightTimeout:
-            continue
-        except Exception:
-            continue
+            _log(
+                "WARN: the DOWNLOAD menu opened but the xlsx file did not start. Retrying."
+            )
+        except Exception as exc:
+            _log(f"WARN: shipment report click failed (attempt {attempt}): {exc}")
 
-    if not menu_clicked:
+    if download is None:
         raise FedexBatchError(
             'Could not download "Shipment report (.xlsx file)" from the DOWNLOAD menu.'
         )
