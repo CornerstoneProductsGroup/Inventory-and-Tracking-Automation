@@ -3292,46 +3292,8 @@ def _select_all_shipment_rows(page: Page, cfg: dict[str, Any]) -> int:
     )
 
 
-def _dismiss_open_menu(page: Page) -> None:
-    try:
-        menu = page.locator(
-            "[role='menu']:visible, .mat-mdc-menu-panel:visible, .mat-menu-panel:visible"
-        ).first
-        if menu.count() > 0 and menu.is_visible():
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(250)
-    except Exception:
-        pass
-
-
-def _visible_shipment_report_menu_item(page: Page):
-    """The open menu row for the xlsx shipment report, not Transaction report."""
-    items = page.locator(
-        "[role='menuitem'], button.mat-mdc-menu-item, .mat-mdc-menu-item, .mat-menu-item"
-    )
-    try:
-        count = items.count()
-    except Exception:
-        return None
-    for i in range(count):
-        item = items.nth(i)
-        try:
-            if not item.is_visible():
-                continue
-            text = item.inner_text(timeout=2000) or ""
-        except Exception:
-            continue
-        if re.search(r"transaction\s+report", text, re.I):
-            continue
-        if re.search(r"shipment\s+report", text, re.I):
-            return item
-    return None
-
-
-def _open_download_menu(page: Page, cfg: dict[str, Any]) -> None:
-    if _visible_shipment_report_menu_item(page) is not None:
-        return
-    download_btn = _sel(
+def _download_button_selector(cfg: dict[str, Any]) -> str:
+    return _sel(
         cfg,
         "download_button",
         (
@@ -3339,88 +3301,148 @@ def _open_download_menu(page: Page, cfg: dict[str, Any]) -> None:
             "[role='button']:has-text('DOWNLOAD'), .fdx-c-button:has-text('DOWNLOAD')"
         ),
     )
-    if not _click_first(page, download_btn, timeout_ms=15_000):
-        raise FedexBatchError("Could not click DOWNLOAD on the shipment list.")
+
+
+def _shipment_report_menu_item(page: Page):
+    """Visible DOWNLOAD-menu row for the xlsx shipment report, not Transaction report."""
+    pattern = re.compile(r"shipment\s+report", re.I)
+    loc = page.locator(
+        "a, button, [role='menuitem'], [role='option'], li, span, div"
+    ).filter(has_text=pattern)
+    best = None
+    best_len = 10**9
     try:
-        page.locator(
-            "[role='menu'], .mat-mdc-menu-panel, .mat-menu-panel"
-        ).first.wait_for(state="visible", timeout=8000)
-    except PlaywrightTimeout as exc:
-        raise FedexBatchError("DOWNLOAD was clicked but the report menu did not open.") from exc
-
-
-def _download_shipment_report_xlsx(page: Page, cfg: dict[str, Any], dest: Path) -> None:
-    """Select all rows, DOWNLOAD → Shipment report (.xlsx), save to fixed master path."""
-    dest = dest.resolve()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    timeout_ms = shipment_report_download_timeout_ms()
-
-    selected = _select_all_shipment_rows(page, cfg)
-    if selected == 0:
-        raise FedexBatchError("No shipment rows to include in the report.")
-
-    download = None
-    per_try_ms = min(45_000, timeout_ms)
-    for attempt in range(1, 4):
-        _dismiss_open_menu(page)
+        count = min(loc.count(), 40)
+    except Exception:
+        return None
+    for i in range(count):
+        item = loc.nth(i)
         try:
-            _open_download_menu(page, cfg)
-        except FedexBatchError as exc:
-            _log(f"WARN: shipment report menu attempt {attempt}: {exc}")
-            page.wait_for_timeout(500)
+            if not item.is_visible():
+                continue
+            text = " ".join((item.inner_text(timeout=1000) or "").split())
+        except Exception:
             continue
-        item = _visible_shipment_report_menu_item(page)
-        if item is None:
-            _log(
-                f"WARN: Shipment report row was not visible in the DOWNLOAD menu "
-                f"(attempt {attempt})."
-            )
+        if not text or "transaction" in text.lower() or not pattern.search(text):
             continue
-        _log(f"Clicking Shipment report (.xlsx) (attempt {attempt})…")
-        try:
-            with page.context.expect_download(timeout=per_try_ms) as dl_info:
-                box = None
-                try:
-                    box = item.bounding_box()
-                except Exception:
-                    box = None
-                if box and box.get("width", 0) > 4 and box.get("height", 0) > 4:
-                    page.mouse.click(
-                        box["x"] + box["width"] / 2,
-                        box["y"] + box["height"] / 2,
-                    )
-                else:
-                    item.click(timeout=8000, force=True)
-            download = dl_info.value
-            break
-        except PlaywrightTimeout:
-            _log(
-                "WARN: the DOWNLOAD menu opened but the xlsx file did not start. Retrying."
-            )
-        except Exception as exc:
-            _log(f"WARN: shipment report click failed (attempt {attempt}): {exc}")
+        if len(text) < best_len:
+            best = item
+            best_len = len(text)
+    return best
 
-    if download is None:
-        raise FedexBatchError(
-            'Could not download "Shipment report (.xlsx file)" from the DOWNLOAD menu.'
+
+def _click_download_toolbar(page: Page, cfg: dict[str, Any]) -> None:
+    if not _click_first(page, _download_button_selector(cfg), timeout_ms=15_000):
+        raise FedexBatchError("Could not click DOWNLOAD on the shipment list.")
+
+
+def _open_download_menu(page: Page, cfg: dict[str, Any]) -> None:
+    if _shipment_report_menu_item(page) is not None:
+        return
+    _click_download_toolbar(page, cfg)
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        if _shipment_report_menu_item(page) is not None:
+            return
+        page.wait_for_timeout(200)
+    raise FedexBatchError("DOWNLOAD was clicked but the Shipment report choice did not appear.")
+
+
+def _close_download_menu(page: Page, cfg: dict[str, Any]) -> None:
+    """Toggle DOWNLOAD shut. Escape can also clear the selected shipments."""
+    if _shipment_report_menu_item(page) is None:
+        return
+    try:
+        _click_download_toolbar(page, cfg)
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+
+def _click_shipment_report_choice(item) -> str:
+    """Click the menu row itself, not a coordinate that can miss the open list."""
+    label = ""
+    try:
+        label = " ".join((item.inner_text(timeout=1000) or "").split())
+    except Exception:
+        label = "Shipment report"
+    clickable = item
+    try:
+        parent = item.locator(
+            "xpath=ancestor-or-self::*[self::button or self::a or @role='menuitem'][1]"
         )
+        if parent.count() > 0 and parent.first.is_visible():
+            clickable = parent.first
+    except Exception:
+        pass
+    try:
+        clickable.click(timeout=8000)
+    except Exception:
+        clickable.click(timeout=8000, force=True)
+    return label
 
-    # Write to a sidecar first, then replace. Never delete the existing master
-    # until the new report is on disk — a failed save_as used to leave the
-    # tracking folder empty, and CommerceHub tracking then had no file.
+
+def _browser_download_dirs() -> list[Path]:
+    """Folders Edge/Chrome may use when the report bypasses Playwright's download event."""
+    home = Path.home()
+    candidates = [
+        home / "Downloads",
+        home / "OneDrive" / "Downloads",
+        Path(os.environ.get("USERPROFILE") or "") / "Downloads",
+    ]
+    found: list[Path] = []
+    seen: set[str] = set()
+    for folder in candidates:
+        try:
+            if not folder.is_dir():
+                continue
+            key = str(folder.resolve()).lower()
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(folder)
+    return found
+
+
+def _newest_xlsx_since(folders: list[Path], started: float) -> Path | None:
+    newest: Path | None = None
+    newest_mtime = started - 2.0
+    for folder in folders:
+        try:
+            paths = list(folder.glob("*.xlsx"))
+        except OSError:
+            continue
+        for path in paths:
+            if path.name.startswith("~$"):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_size < 100 or stat.st_mtime < newest_mtime:
+                continue
+            newest = path
+            newest_mtime = stat.st_mtime
+    return newest
+
+
+def _commit_shipment_report_file(src: Path, dest: Path) -> None:
+    """Copy a finished xlsx onto the tracking share without deleting the current master first."""
+    if not src.is_file() or src.stat().st_size < 100:
+        raise FedexBatchError(f"Shipment report file is missing or empty: {src}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.with_name(f"{dest.stem}.partial{dest.suffix}")
     try:
         if partial.exists():
             partial.unlink()
     except OSError:
         pass
-
     try:
-        download.save_as(str(partial))
+        shutil.copy2(src, partial)
         if not partial.is_file() or partial.stat().st_size < 100:
-            raise FedexBatchError(
-                f"Shipment report download failed or file is empty: {partial}"
-            )
+            raise FedexBatchError(f"Shipment report copy is empty: {partial}")
         os.replace(str(partial), str(dest))
     except Exception:
         try:
@@ -3434,11 +3456,105 @@ def _download_shipment_report_xlsx(page: Page, cfg: dict[str, Any], dest: Path) 
                 f"kept existing {dest.name} ({dest.stat().st_size:,} bytes)."
             )
         raise
-
     if not dest.is_file() or dest.stat().st_size < 100:
         raise FedexBatchError(f"Shipment report download failed or file is empty: {dest}")
-
     _log(f"Saved Lowe's Fedex Master ({dest.stat().st_size:,} bytes) → {dest}")
+
+
+def _download_shipment_report_xlsx(page: Page, cfg: dict[str, Any], dest: Path) -> None:
+    """Select all rows, DOWNLOAD → Shipment report (.xlsx), save to fixed master path."""
+    dest = dest.resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    timeout_ms = shipment_report_download_timeout_ms()
+
+    selected = _select_all_shipment_rows(page, cfg)
+    if selected == 0:
+        raise FedexBatchError("No shipment rows to include in the report.")
+
+    captured: list[Any] = []
+
+    def _on_download(download) -> None:
+        captured.append(download)
+
+    page.context.on("download", _on_download)
+    download_dirs = _browser_download_dirs()
+    per_try_s = min(60.0, max(20.0, timeout_ms / 1000.0 / 2))
+    local_copy: Path | None = None
+    try:
+        for attempt in range(1, 4):
+            _close_download_menu(page, cfg)
+            started = time.time()
+            captured.clear()
+            try:
+                _open_download_menu(page, cfg)
+            except FedexBatchError as exc:
+                _log(f"WARN: shipment report menu attempt {attempt}: {exc}")
+                page.wait_for_timeout(500)
+                continue
+            item = _shipment_report_menu_item(page)
+            if item is None:
+                _log(
+                    f"WARN: Shipment report row was not visible in the DOWNLOAD menu "
+                    f"(attempt {attempt})."
+                )
+                continue
+            try:
+                label = _click_shipment_report_choice(item)
+            except Exception as exc:
+                _log(f"WARN: could not click Shipment report (attempt {attempt}): {exc}")
+                continue
+            _log(f"Clicked {label!r} (attempt {attempt}); waiting for the xlsx…")
+            deadline = time.monotonic() + per_try_s
+            dropped: Path | None = None
+            while time.monotonic() < deadline:
+                if captured:
+                    break
+                dropped = _newest_xlsx_since(download_dirs, started)
+                if dropped is not None:
+                    break
+                page.wait_for_timeout(400)
+            if captured:
+                local_copy = Path(tempfile.mkdtemp(prefix="fedex_report_")) / dest.name
+                captured[-1].save_as(str(local_copy))
+                _log(f"Shipment report captured from the browser ({local_copy.stat().st_size:,} bytes).")
+                break
+            if dropped is not None:
+                last_size = -1
+                stable = False
+                for _ in range(10):
+                    try:
+                        size = dropped.stat().st_size
+                    except OSError:
+                        size = 0
+                    if size >= 100 and size == last_size:
+                        stable = True
+                        break
+                    last_size = size
+                    page.wait_for_timeout(300)
+                if not stable:
+                    continue
+                local_copy = Path(tempfile.mkdtemp(prefix="fedex_report_")) / dest.name
+                shutil.copy2(dropped, local_copy)
+                _log(
+                    f"Shipment report found in Downloads ({dropped.name}, "
+                    f"{local_copy.stat().st_size:,} bytes)."
+                )
+                break
+            _log("WARN: Shipment report was clicked but no xlsx arrived. Retrying.")
+    finally:
+        try:
+            page.context.remove_listener("download", _on_download)
+        except Exception:
+            pass
+
+    if local_copy is None:
+        raise FedexBatchError(
+            'Could not download "Shipment report (.xlsx file)" from the DOWNLOAD menu.'
+        )
+    try:
+        _commit_shipment_report_file(local_copy, dest)
+    finally:
+        shutil.rmtree(local_copy.parent, ignore_errors=True)
 
 
 def _export_shipment_report_for_tracking(page: Page, cfg: dict[str, Any]) -> None:
