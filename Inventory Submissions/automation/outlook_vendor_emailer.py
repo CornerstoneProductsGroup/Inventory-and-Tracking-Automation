@@ -794,6 +794,48 @@ def _set_mail_body_with_optional_signature(
     return opened
 
 
+def _show_vendor_email_popup(rows: list[tuple[str, bool, str]]) -> None:
+    """Windows dialog, separate from the command prompt, after a real send."""
+    sent_names = [name for name, did_send, _note in rows if did_send]
+    missed = [(name, note) for name, did_send, note in rows if not did_send]
+    lines = [
+        f"Emails sent: {len(sent_names)}",
+        f"Vendor folders in today's daily orders: {len(rows)}",
+        "",
+        "Every vendor on the email list is counted when their folder is in",
+        "z- Daily Vendor Orders, even if that folder is empty.",
+        "",
+    ]
+    if not rows:
+        lines.append("No email-list vendor folders were in today's daily orders.")
+    else:
+        lines.append("Sent:")
+        if sent_names:
+            lines.extend(f"  {name}" for name in sent_names)
+        else:
+            lines.append("  (none)")
+        lines.append("")
+        lines.append("Not sent:")
+        if missed:
+            lines.extend(f"  {name} — {note}" for name, note in missed)
+        else:
+            lines.append("  (none)")
+    text = "\n".join(lines)
+    _log(text.replace("\n", " | "))
+    try:
+        import ctypes
+
+        # OK + information icon + foreground + topmost, so it sits over the menu.
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            text,
+            "Vendor emails",
+            0x00000040 | 0x00010000 | 0x00040000,
+        )
+    except Exception as exc:
+        _log(f"WARN: could not open the vendor email summary window: {exc}")
+
+
 def send_vendor_emails(
     *,
     config_path: Path,
@@ -845,6 +887,14 @@ def send_vendor_emails(
             raise VendorEmailError(f"Could not open Outlook address book: {exc}") from exc
     sent = 0
     skipped = 0
+    send_failures = 0
+    show_summary = not dry_run and not preview
+    # Email-list vendors whose folder exists today, even when the folder is empty.
+    folder_rows: list[tuple[str, bool, str]] = []
+
+    def _count_folder(did_send: bool, note: str) -> None:
+        if show_summary:
+            folder_rows.append((vendor, did_send, note))
 
     for entry in cfg.vendors:
         vendor = entry.vendor_folder
@@ -863,19 +913,23 @@ def send_vendor_emails(
         attachments = _collect_vendor_attachments(cfg, vendor)
         if not attachments:
             _log(f"Skip {vendor!r}: no files to attach.")
+            _count_folder(False, "folder is there, nothing to attach")
             skipped += 1
             continue
 
         if not entry.to:
             _log(f"Skip {vendor!r}: TO is empty in config.")
+            _count_folder(False, "folder is there, TO is empty")
             skipped += 1
             continue
         if not entry.subject:
             _log(f"Skip {vendor!r}: subject is empty in config.")
+            _count_folder(False, "folder is there, subject is empty")
             skipped += 1
             continue
         if not entry.body.strip():
             _log(f"Skip {vendor!r}: body is empty in config.")
+            _count_folder(False, "folder is there, body is empty")
             skipped += 1
             continue
 
@@ -950,42 +1004,49 @@ def send_vendor_emails(
             sent += 1
             continue
 
-        mail = app.CreateItem(0)  # olMailItem
-        mail.Subject = final_subject
-        unresolved = _apply_mail_recipients(mail, namespace, to=entry.to, cc=entry.cc)
-        if unresolved:
-            _log(f"  WARN: initial add could not resolve: {', '.join(unresolved)}")
-        for path in attachments:
+        try:
+            mail = app.CreateItem(0)  # olMailItem
+            mail.Subject = final_subject
+            unresolved = _apply_mail_recipients(mail, namespace, to=entry.to, cc=entry.cc)
+            if unresolved:
+                _log(f"  WARN: initial add could not resolve: {', '.join(unresolved)}")
+            for path in attachments:
+                try:
+                    mail.Attachments.Add(str(path))
+                except Exception as exc:
+                    raise VendorEmailError(
+                        f"{vendor}: failed adding attachment {path.name!r}: {exc}"
+                    ) from exc
             try:
-                mail.Attachments.Add(str(path))
+                _set_mail_body_with_optional_signature(
+                    mail,
+                    entry.body,
+                    signature_name=cfg.outlook_signature_name,
+                    signature_image_path=cfg.signature_image_path,
+                    show_window=False,
+                )
             except Exception as exc:
                 raise VendorEmailError(
-                    f"{vendor}: failed adding attachment {path.name!r}: {exc}"
+                    f"{vendor}: failed while setting body/signature: {exc}"
                 ) from exc
-        try:
-            _set_mail_body_with_optional_signature(
-                mail,
-                entry.body,
-                signature_name=cfg.outlook_signature_name,
-                signature_image_path=cfg.signature_image_path,
-                show_window=False,
+            _dedupe_mail_recipients(mail)
+            _finalize_recipients_before_send(
+                mail, namespace, vendor=vendor, for_send=True
             )
-        except Exception as exc:
-            raise VendorEmailError(
-                f"{vendor}: failed while setting body/signature: {exc}"
-            ) from exc
-        _dedupe_mail_recipients(mail)
-        _finalize_recipients_before_send(
-            mail, namespace, vendor=vendor, for_send=True
-        )
-        _log_recipient_resolution(
-            mail, to=entry.to, cc=entry.cc, unresolved=[], namespace=namespace
-        )
-        try:
-            mail.Send()
-        except Exception as exc:
-            raise VendorEmailError(f"{vendor}: failed on Send(): {exc}") from exc
+            _log_recipient_resolution(
+                mail, to=entry.to, cc=entry.cc, unresolved=[], namespace=namespace
+            )
+            try:
+                mail.Send()
+            except Exception as exc:
+                raise VendorEmailError(f"{vendor}: failed on Send(): {exc}") from exc
+        except VendorEmailError as exc:
+            send_failures += 1
+            _count_folder(False, str(exc))
+            _log(f"ERROR: {exc}")
+            continue
         sent += 1
+        _count_folder(True, "sent")
         _log(f"Sent {vendor!r}")
         time.sleep(max(0.0, send_delay_s))
 
@@ -997,4 +1058,6 @@ def send_vendor_emails(
     _log(f"Done. {label} {sent}; skipped {skipped}.")
     if filter_cf and sent == 0 and skipped == 0:
         _log(f"No vendor matched filter {vendor_filter!r}. Check vendor_folder in JSON.")
-    return 0
+    if show_summary:
+        _show_vendor_email_popup(folder_rows)
+    return 1 if send_failures else 0
