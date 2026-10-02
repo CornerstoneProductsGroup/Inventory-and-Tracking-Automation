@@ -419,6 +419,149 @@ def _option_texts(page: Page, aria: str) -> list[str]:
     )
 
 
+_TIME_RE = re.compile(r"^\s*0?(\d{1,2})[:.](\d{2})\s*([AaPp])\.?\s*[Mm]\.?\s*$")
+
+
+def _canonical_time(text: str) -> str:
+    """'10:00 AM', '10:00\u00a0am', '04:00 P.M.' → '10:00 AM' / '4:00 PM'."""
+    raw = (text or "").replace("\u00a0", " ").replace("\u202f", " ").strip()
+    match = _TIME_RE.match(raw)
+    if not match:
+        return ""
+    hour = int(match.group(1))
+    if hour < 1 or hour > 12:
+        return ""
+    ampm = "AM" if match.group(3).upper() == "A" else "PM"
+    return f"{hour}:{match.group(2)} {ampm}"
+
+
+def _visible_select(page: Page, aria: str):
+    """The on-screen dropdown. A later hidden copy of the same label has no options."""
+    loc = page.locator(f'select[aria-label="{aria}"]')
+    count = loc.count()
+    if count == 0:
+        raise FedexPickupError(f"Dropdown not found: {aria}")
+    for i in range(count - 1, -1, -1):
+        item = loc.nth(i)
+        try:
+            if item.is_visible():
+                return item
+        except Exception:
+            continue
+    return loc.last
+
+
+def _select_records(sel) -> list[dict[str, Any]]:
+    return sel.evaluate(
+        """s => [...s.options].map(o => ({
+            text: (o.textContent || '').replace(/\\s+/g, ' ').trim(),
+            value: o.value || '',
+            disabled: !!o.disabled
+        }))"""
+    )
+
+
+def _match_time_option(options: list[dict[str, Any]], wanted: str) -> dict[str, Any] | None:
+    target = _canonical_time(wanted)
+    if not target:
+        raise FedexPickupError(f"Pickup time {wanted!r} is not a time like '10:00 AM'")
+    for opt in options:
+        if opt.get("disabled"):
+            continue
+        if _canonical_time(opt.get("text") or "") == target:
+            return opt
+        if _canonical_time(opt.get("value") or "") == target:
+            return opt
+    return None
+
+
+def _select_time(page: Page, aria: str, wanted: str) -> str:
+    """Pick a pickup time.
+
+    Playwright's select_option waits until an option with that exact label is
+    visible. On this form the Earliest list often has no match under that
+    check, so it sat for two minutes and Latest was never changed. Read the
+    options ourselves and set the value the way Angular expects.
+    """
+    sel = _visible_select(page, aria)
+    try:
+        sel.scroll_into_view_if_needed(timeout=5_000)
+    except Exception:
+        pass
+
+    opened = False
+    options: list[dict[str, Any]] = []
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        options = _select_records(sel)
+        if _match_time_option(options, wanted):
+            break
+        usable = [
+            opt
+            for opt in options
+            if _canonical_time(opt.get("text") or "") or _canonical_time(opt.get("value") or "")
+        ]
+        if not usable and not opened:
+            _log(f"{aria}: list is empty, opening it so FedEx fills the times…")
+            sel.evaluate(
+                """s => {
+                    s.focus();
+                    s.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    s.click();
+                }"""
+            )
+            opened = True
+            page.wait_for_timeout(700)
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(400)
+            continue
+        page.wait_for_timeout(400)
+
+    match = _match_time_option(options, wanted)
+    if not match:
+        shown: list[str] = []
+        for opt in options:
+            label = opt.get("text") or opt.get("value") or "(blank)"
+            if opt.get("disabled"):
+                label = f"{label} (disabled)"
+            shown.append(label)
+        raise FedexPickupError(f"{aria}: {wanted!r} is not in the list. FedEx offered: {shown}")
+
+    sel.evaluate(
+        """(s, spec) => {
+            const opt = [...s.options].find(o =>
+                o.value === spec.value &&
+                (o.textContent || '').replace(/\\s+/g, ' ').trim() === spec.text);
+            if (!opt) return;
+            const desc = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value');
+            if (desc && desc.set) desc.set.call(s, opt.value);
+            else s.value = opt.value;
+            opt.selected = true;
+            s.dispatchEvent(new Event('input', { bubbles: true }));
+            s.dispatchEvent(new Event('change', { bubbles: true }));
+            s.dispatchEvent(new Event('blur', { bubbles: true }));
+        }""",
+        {"text": match.get("text") or "", "value": match.get("value") or ""},
+    )
+    page.wait_for_timeout(500)
+    got = sel.evaluate(
+        "s => ((s.options[s.selectedIndex] || {}).textContent || '').replace(/\\s+/g, ' ').trim()"
+    )
+    if _canonical_time(got) != _canonical_time(wanted):
+        label = (match.get("text") or "").strip()
+        if label:
+            sel.select_option(label=label, timeout=8_000)
+        else:
+            sel.select_option(value=match.get("value") or "", timeout=8_000)
+        page.wait_for_timeout(400)
+        got = sel.evaluate(
+            "s => ((s.options[s.selectedIndex] || {}).textContent || '').replace(/\\s+/g, ' ').trim()"
+        )
+    if _canonical_time(got) != _canonical_time(wanted):
+        raise FedexPickupError(f"{aria} shows {got!r}, expected {wanted!r}")
+    return got
+
+
 def _body_text(page: Page) -> str:
     try:
         return page.locator("body").inner_text(timeout=10_000)
@@ -587,18 +730,14 @@ def _fill_pickup_details(
 
     earliest = settings.get("earliest_time") or "10:00 AM"
     latest = settings.get("latest_time") or "4:00 PM"
-    got = _select_by_aria(page, "Earliest possible time", earliest)
-    if got != earliest:
-        raise FedexPickupError(f"Earliest time shows {got!r}, expected {earliest!r}")
+    got_early = _select_time(page, "Earliest possible time", earliest)
     page.wait_for_timeout(800)
-    got = _select_by_aria(page, "Latest possible time", latest)
-    if got != latest:
-        raise FedexPickupError(f"Latest time shows {got!r}, expected {latest!r}")
+    got_late = _select_time(page, "Latest possible time", latest)
     page.wait_for_timeout(1500)
 
     _log(
         f"Form: Ground, {totals.packages} pkg, {totals.weight_for_form} lb, "
-        f"{_selected_text(page, 'Pickup date')}, {earliest}–{latest}, {instr}"
+        f"{_selected_text(page, 'Pickup date')}, {got_early}–{got_late}, {instr}"
     )
     text = _body_text(page)
     costs = [ln.strip() for ln in text.splitlines() if "$" in ln]
