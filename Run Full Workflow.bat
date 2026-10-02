@@ -24,12 +24,14 @@ echo   T  Tracking / Invoicing ^(submenu^)
 echo   I  Inventory ^(submenu^)
 echo   R  Invoice Reports ^(submenu^)
 echo   9  Custom Invoice Report Date ^(pick retailer, then enter date^)
+echo   P  FedEx Pickups ^(schedule next-day Ground pickups — Warehouse / Post Protector^)
 echo.
 echo Invoice reports need commercehub_invoice_export.py in "invoice report" folder.
 echo.
-choice /C FWO01TIR9S /N /M "Press F, W, O, 0, 1, T, I, R, 9, or S: "
-REM choice sets ERRORLEVEL to key index: F=1 W=2 O=3 0=4 1=5 T=6 I=7 R=8 9=9 S=10
+choice /C FWO01TIR9SP /N /M "Press F, W, O, 0, 1, T, I, R, 9, S, or P: "
+REM choice sets ERRORLEVEL to key index: F=1 W=2 O=3 0=4 1=5 T=6 I=7 R=8 9=9 S=10 P=11
 REM "if errorlevel N" means ERRORLEVEL >= N — test highest index first.
+if errorlevel 11 goto SUBMENU_PICKUP
 if errorlevel 10 goto OPT_S
 if errorlevel 9 goto OPT_9
 if errorlevel 8 goto SUBMENU_INVOICE
@@ -327,6 +329,67 @@ goto RUN
 :IR_AMAZON
 set "EXTRA_ARGS=--amazon-seller-download-only"
 goto RUN
+
+:SUBMENU_PICKUP
+cls
+echo.
+echo ============================================================
+echo   FedEx Pickups ^(next business day, Ground, 10 AM - 4 PM^)
+echo ============================================================
+echo   1  Schedule both pickups
+echo   2  Schedule - Our Warehouse only
+echo   3  Schedule - Post Protector only
+echo   4  Dry run - both ^(fills form, does NOT submit^)
+echo   5  Dry run - Our Warehouse
+echo   6  Dry run - Post Protector ^(checks address change^)
+echo   0  Back to main menu
+echo.
+choice /C 0123456 /N /M "Press 0-6: "
+REM 0=1 1=2 2=3 3=4 4=5 5=6 6=7
+if errorlevel 7 goto PU_DRY_PP
+if errorlevel 6 goto PU_DRY_WH
+if errorlevel 5 goto PU_DRY_BOTH
+if errorlevel 4 goto PU_PP
+if errorlevel 3 goto PU_WH
+if errorlevel 2 goto PU_BOTH
+if errorlevel 1 goto MAIN_MENU
+goto SUBMENU_PICKUP
+
+:PU_BOTH
+set "PICKUP_ARGS=--location both"
+goto RUN_PICKUP
+
+:PU_WH
+set "PICKUP_ARGS=--location warehouse"
+goto RUN_PICKUP
+
+:PU_PP
+set "PICKUP_ARGS=--location postprotector"
+goto RUN_PICKUP
+
+:PU_DRY_BOTH
+set "PICKUP_ARGS=--location both --dry-run"
+goto RUN_PICKUP
+
+:PU_DRY_WH
+set "PICKUP_ARGS=--location warehouse --dry-run"
+goto RUN_PICKUP
+
+:PU_DRY_PP
+set "PICKUP_ARGS=--location postprotector --dry-run"
+goto RUN_PICKUP
+
+:RUN_PICKUP
+echo.
+echo Running FedEx pickups...
+if /I not "%RUNNER%"=="python" echo Using: %RUNNER%
+echo Options: %PICKUP_ARGS%
+echo.
+pushd "%~dp0Inventory Submissions"
+"%RUNNER%" "run_fedex_pickup.py" %PICKUP_ARGS%
+set "ERR=!ERRORLEVEL!"
+popd
+goto DONE
 
 :RUN
 echo.

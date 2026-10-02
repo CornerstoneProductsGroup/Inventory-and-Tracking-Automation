@@ -1,0 +1,30 @@
+{
+  "_comment": "FedEx pickup settings. Copy to fedex_pickup.json to override locally. Used by run_fedex_pickup.py.",
+  "pickup_url": "https://www.fedex.com/shippingplus/en-us/pickup/schedule-pickup",
+  "service": "GROUND",
+  "earliest_time": "10:00 AM",
+  "latest_time": "4:00 PM",
+  "pickup_instructions": "No instructions",
+  "warehouse": {
+    "_comment": "Our pickup uses the account's default address. This text must appear on the address card (safety check).",
+    "expected_address_text": "1106 E Turner"
+  },
+  "postprotector": {
+    "_comment": "Vendor names from vendor_map_lowes.xlsx that ship from Post Protector (NOT Post Protector-Here).",
+    "vendors": ["Post Protector"],
+    "address": {
+      "contact_name": "Chris Elliott",
+      "company": "Cornerstone Post Protector",
+      "phone": "4193528688",
+      "phone_extension": "1210",
+      "country": "United States",
+      "address_line_1": "513 Napoleon Rd",
+      "address_line_2": "",
+      "address_line_3": "",
+      "zip": "43402",
+      "state": "Ohio",
+      "city": "Bowling Green",
+      "residential": false
+    }
+  }
+}
