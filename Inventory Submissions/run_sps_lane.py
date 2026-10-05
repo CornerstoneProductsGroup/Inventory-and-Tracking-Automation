@@ -120,21 +120,29 @@ def main() -> int:
         page = context.new_page()
         page.set_default_timeout(settings.timeout_ms)
 
+        signed_in = False
         try:
             from run_sps_tracking import ensure_sps_session, interactive_login_then_save
 
-            if args.interactive_login:
-                interactive_login_then_save(page, context, state_path)
-            else:
-                ensure_sps_session(
-                    page,
-                    context,
-                    state_path,
-                    headless=bool(args.headless),
-                    allow_manual=not args.headless,
-                )
+            try:
+                if args.interactive_login:
+                    interactive_login_then_save(page, context, state_path)
+                else:
+                    ensure_sps_session(
+                        page,
+                        context,
+                        state_path,
+                        headless=bool(args.headless),
+                        allow_manual=not args.headless,
+                    )
+                signed_in = True
+            except Exception as exc:
+                msg = str(exc).strip() or exc.__class__.__name__
+                print(f"ERROR: {msg}")
+                record_error("SPS sign-in", msg)
+                step_errors.append(f"SPS sign-in: {msg}")
 
-            if args.with_invoice_reports:
+            if signed_in and args.with_invoice_reports:
                 from automation.sps_cdp_invoice import run_tractor_invoice_via_cdp
 
                 _run_step(
@@ -142,7 +150,9 @@ def main() -> int:
                     lambda: run_tractor_invoice_via_cdp(cdp_url, report_day=invoice_day),
                 )
 
-            if not args.skip_inventory:
+            if not signed_in:
+                print("SPS lane stopped: sign-in did not finish, so inventory and tracking were not started.")
+            elif not args.skip_inventory:
                 print("\n=== SPS Commerce — Tractor Supply inventory ===")
                 _run_step(
                     "SPS inventory",
@@ -152,7 +162,7 @@ def main() -> int:
                 print("\n=== SPS inventory skipped ===")
                 _lane_skip("SPS inventory", "Disabled via --skip-inventory")
 
-            if not args.skip_tracking:
+            if signed_in and not args.skip_tracking:
                 if not args.skip_tractor:
                     print("\n=== SPS Commerce — Tractor Supply tracking ===")
                     _run_step(
@@ -183,15 +193,16 @@ def main() -> int:
                             ensure_session=False,
                         ),
                     )
-            else:
+            elif signed_in and args.skip_tracking:
                 print("\n=== SPS tracking skipped ===")
                 _lane_skip("SPS tracking", "Disabled via --skip-tracking")
 
-            try:
-                context.storage_state(path=str(state_path))
-                print(f"Saved SPS session: {state_path}")
-            except OSError as exc:
-                print(f"Warning: could not save SPS session ({exc})")
+            if signed_in:
+                try:
+                    context.storage_state(path=str(state_path))
+                    print(f"Saved SPS session: {state_path}")
+                except Exception as exc:
+                    print(f"Warning: could not save SPS session ({exc})")
         finally:
             context.close()
             browser.close()

@@ -542,6 +542,32 @@ def wait_for_transactions_page_ready(page: Page, *, timeout_ms: int = 45_000) ->
     raise RuntimeError("Transactions page did not become ready in time.")
 
 
+_SPS_WINDOW_CLOSED_MSG = (
+    "SPS Commerce window was closed before sign-in finished. "
+    "Leave that browser open until login completes (finish MFA if it appears), then re-run."
+)
+
+
+def _page_is_open(page: Page) -> bool:
+    try:
+        return not page.is_closed()
+    except Exception:
+        return False
+
+
+def _is_target_closed_error(exc: BaseException) -> bool:
+    if type(exc).__name__ == "TargetClosedError":
+        return True
+    text = str(exc).lower()
+    return "has been closed" in text or "target closed" in text
+
+
+def _raise_if_sps_window_closed(page: Page, exc: BaseException | None = None) -> None:
+    closed = _is_target_closed_error(exc) if exc is not None else False
+    if closed or not _page_is_open(page):
+        raise RuntimeError(_SPS_WINDOW_CLOSED_MSG) from exc
+
+
 def _load_sps_login_settings() -> tuple[str, str, str, int]:
     try:
         settings = load_sps_settings()
@@ -608,18 +634,22 @@ def ensure_sps_session(
         try:
             page.goto(probe_url, wait_until="domcontentloaded", timeout=120_000)
             page.wait_for_timeout(700)
-        except Exception:
+        except Exception as exc:
+            if _is_target_closed_error(exc) or not _page_is_open(page):
+                break
             continue
         if _session_ready_for_workflow(page):
             _save_sps_session_if_ready(page, context, storage_path, label="SPS session OK; refreshed storage")
             return
 
+    _raise_if_sps_window_closed(page)
     print("SPS session is not valid for transactions — clearing stale cookies and re-authenticating.")
     _invalidate_stale_sps_session(context, storage_path)
 
     if not headless and allow_manual:
         if login_with_env_credentials_then_save(page, context, storage_path):
             return
+        _raise_if_sps_window_closed(page)
         interactive_login_then_save(page, context, storage_path)
         return
 
@@ -639,7 +669,9 @@ def _perform_sps_login(page: Page, username: str, password: str, timeout_ms: int
     if not username or not password:
         return False
     per_attempt_timeout = max(8_000, min(timeout_ms, 35_000))
+    last_error: Exception | None = None
     for attempt in range(1, 4):
+        _raise_if_sps_window_closed(page)
         try:
             # Username step.
             user = page.locator("input[name='username']").first
@@ -676,16 +708,24 @@ def _perform_sps_login(page: Page, username: str, password: str, timeout_ms: int
                 if attempt > 1:
                     print(f"SPS credential submit succeeded on attempt {attempt}.")
                 return True
-        except Exception:
-            pass
+        except Exception as exc:
+            if _is_target_closed_error(exc) or not _page_is_open(page):
+                raise RuntimeError(_SPS_WINDOW_CLOSED_MSG) from exc
+            last_error = exc
+            print(f"SPS login attempt {attempt} failed: {exc}")
 
         # Recover for next try: many IdP pages need a clean reload.
         if attempt < 3:
+            _raise_if_sps_window_closed(page)
             try:
                 page.goto("https://commerce.spscommerce.com", wait_until="domcontentloaded", timeout=60_000)
                 page.wait_for_timeout(500)
-            except Exception:
-                pass
+            except Exception as exc:
+                if _is_target_closed_error(exc) or not _page_is_open(page):
+                    raise RuntimeError(_SPS_WINDOW_CLOSED_MSG) from exc
+                last_error = exc
+    if last_error is not None:
+        print(f"SPS auto-login stopped after 3 attempts. Last error: {last_error}")
     return False
 
 
@@ -701,7 +741,12 @@ def _wait_for_authenticated_sps(page: Page, timeout_ms: int = 120_000) -> bool:
 def interactive_login_then_save(page: Page, context: BrowserContext, storage_path: Path) -> None:
     """Try .env login first; allow manual completion fallback; then save session."""
     start_url, username, password, timeout_ms = _load_sps_login_settings()
-    page.goto(start_url, wait_until="domcontentloaded", timeout=120_000)
+    _raise_if_sps_window_closed(page)
+    try:
+        page.goto(start_url, wait_until="domcontentloaded", timeout=120_000)
+    except Exception as exc:
+        _raise_if_sps_window_closed(page, exc)
+        raise
 
     attempted_env = _perform_sps_login(page, username, password, timeout_ms)
     if attempted_env:
@@ -714,6 +759,7 @@ def interactive_login_then_save(page: Page, context: BrowserContext, storage_pat
             ">>> Complete SPS sign-in in the browser (including MFA if prompted), then press Enter."
         )
         input(">>> Press Enter once SPS is fully logged in...\n")
+        _raise_if_sps_window_closed(page)
         if not _session_ready_for_workflow(page):
             raise RuntimeError(
                 "SPS login was not detected after manual sign-in (transactions page did not load)."
@@ -737,6 +783,8 @@ def login_with_env_credentials_then_save(
     try:
         page.goto(start_url, wait_until="domcontentloaded", timeout=120_000)
     except Exception as ex:
+        if _is_target_closed_error(ex) or not _page_is_open(page):
+            raise RuntimeError(_SPS_WINDOW_CLOSED_MSG) from ex
         print(f"Could not open SPS login URL for auto-login: {ex}")
         return False
 
