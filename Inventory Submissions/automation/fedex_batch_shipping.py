@@ -80,6 +80,10 @@ class FedexBatchError(Exception):
     pass
 
 
+class DownloadMenuEmpty(FedexBatchError):
+    """DOWNLOAD's popup opened and stayed blank. Clicking it again does not fill it."""
+
+
 _REFERENCE_RE = re.compile(r"(\d{5,}\s+.+)")
 
 
@@ -3243,46 +3247,108 @@ def _count_checked_shipment_rows(page: Page, cfg: dict[str, Any]) -> tuple[int, 
     return checked, total
 
 
-def _select_all_shipment_rows(page: Page, cfg: dict[str, Any]) -> int:
-    """Select every row on the shipment list (header select-all, then any row it missed)."""
-    _clear_row_selection(page, cfg)
-    page.wait_for_timeout(300)
+def _selection_count_matches(ui_selected: int | None, total: int) -> bool:
+    """FedEx's own 'N shipments selected' count, not only the checkbox paint."""
+    return ui_selected is not None and total > 0 and ui_selected >= total
 
+
+def _click_header_select_all(page: Page, cfg: dict[str, Any]) -> bool:
+    """Click the header checkbox. A forced .check() paints the boxes without selecting them."""
     for sel in _select_all_checkbox_selectors(cfg):
         try:
-            loc = page.locator(sel).first
-            if page.locator(sel).count() == 0:
+            loc = page.locator(sel)
+            if loc.count() == 0:
                 continue
-            loc.wait_for(state="visible", timeout=5000)
-            if sel.endswith("input[type='checkbox']"):
-                if not loc.is_checked():
-                    loc.check(force=True)
-            else:
-                loc.click(timeout=8000)
+            loc.first.wait_for(state="visible", timeout=5000)
+            loc.first.click(timeout=8000)
             page.wait_for_timeout(600)
-            checked, total = _count_checked_shipment_rows(page, cfg)
-            if total > 0 and checked == total:
-                _log(f"Select-all: {checked} shipment row(s) checked.")
-                return checked
-            if checked > 0:
-                _log(f"Select-all checked {checked}/{total}; filling in the rest.")
-                break
+            return True
         except Exception:
             continue
+    return False
 
+
+def _select_each_shipment_row(page: Page, cfg: dict[str, Any]) -> tuple[int, int, int | None]:
+    """Click every row checkbox so FedEx's selection count actually updates."""
     row_sel = _sel(cfg, "shipment_table_row", "table tbody tr.mat-mdc-row, tr.mat-mdc-row")
-    rows = page.locator(row_sel)
-    for i in range(rows.count()):
-        row = rows.nth(i)
-        ref = _row_reference_text(row)
-        if not ref or _is_row_checked(row, cfg):
+    use_ctrl = False
+    checked = 0
+    total = 0
+    ui_selected: int | None = None
+    for attempt in range(1, 3):
+        restarted = False
+        rows = page.locator(row_sel)
+        for i in range(rows.count()):
+            row = rows.nth(i)
+            ref = _row_reference_text(row)
+            if not ref or not re.match(r"^\d{5,}", ref) or _is_row_checked(row, cfg):
+                continue
+            before = _read_shipments_selected_count(page)
+            if not _click_row_checkbox(
+                row, cfg, ref, ctrl_click=use_ctrl and before not in (None, 0)
+            ):
+                continue
+            after = _read_shipments_selected_count(page)
+            if before not in (None, 0) and after == 1 and not use_ctrl:
+                _log(
+                    "Plain checkbox click replaced the selection. "
+                    "Selecting the report rows again with Ctrl held."
+                )
+                use_ctrl = True
+                _clear_row_selection(page, cfg)
+                page.wait_for_timeout(400)
+                restarted = True
+                break
+        if restarted:
             continue
-        _click_row_checkbox(row, cfg, ref, ctrl_click=True)
+        checked, total = _count_checked_shipment_rows(page, cfg)
+        ui_selected = _read_shipments_selected_count(page)
+        _log(
+            f"Report row selection: {checked}/{total} checked, "
+            f"FedEx reports {ui_selected if ui_selected is not None else '?'} selected."
+        )
+        if _selection_count_matches(ui_selected, total) and checked == total:
+            return checked, total, ui_selected
+        if attempt == 1:
+            _clear_row_selection(page, cfg)
+            page.wait_for_timeout(400)
+    return checked, total, ui_selected
+
+
+def _select_all_shipment_rows(page: Page, cfg: dict[str, Any]) -> int:
+    """Select every row, and require FedEx's selected-count to match.
+
+    The Download menu stays blank when the boxes look checked but FedEx has
+    no selection. Clicking Download again does not add Shipment report.
+    """
+    _clear_row_selection(page, cfg)
+    page.wait_for_timeout(300)
+    _click_header_select_all(page, cfg)
 
     checked, total = _count_checked_shipment_rows(page, cfg)
     ui_selected = _read_shipments_selected_count(page)
-    if total > 0 and checked == total and (ui_selected is None or ui_selected >= total):
-        _log(f"Select-all: {checked} shipment row(s) checked.")
+    if checked == total and _selection_count_matches(ui_selected, total):
+        _log(f"Select-all: {checked} shipment row(s) checked, FedEx reports {ui_selected} selected.")
+        return checked
+
+    if total > 0 and checked == total:
+        _log(
+            f"Checkboxes show {checked}/{total} checked, but FedEx reports "
+            f"{ui_selected if ui_selected is not None else 'no'} shipment(s) selected. "
+            "Selecting each row so the Download menu has something to list."
+        )
+        _clear_row_selection(page, cfg)
+        page.wait_for_timeout(400)
+        still_checked, _ = _count_checked_shipment_rows(page, cfg)
+        if still_checked == total:
+            _click_header_select_all(page, cfg)
+            page.wait_for_timeout(500)
+    elif checked > 0:
+        _log(f"Select-all checked {checked}/{total}; selecting the rows that were missed.")
+
+    checked, total, ui_selected = _select_each_shipment_row(page, cfg)
+    if checked == total and _selection_count_matches(ui_selected, total):
+        _log(f"Select-all: {checked} shipment row(s) checked, FedEx reports {ui_selected} selected.")
         return checked
 
     raise FedexBatchError(
@@ -3303,60 +3369,169 @@ def _download_button_selector(cfg: dict[str, Any]) -> str:
     )
 
 
-def _shipment_report_menu_item(page: Page):
-    """Visible DOWNLOAD-menu row for the xlsx shipment report, not Transaction report."""
-    pattern = re.compile(r"shipment\s+report", re.I)
-    loc = page.locator(
-        "a, button, [role='menuitem'], [role='option'], li, span, div"
-    ).filter(has_text=pattern)
-    best = None
-    best_len = 10**9
+_SHIPMENT_REPORT_RE = re.compile(r"shipment\s+report", re.I)
+_DOWNLOAD_MENU_PANEL = (
+    ".cdk-overlay-container .mat-mdc-menu-panel, "
+    ".cdk-overlay-container .mat-menu-panel, "
+    ".cdk-overlay-container [role='menu']"
+)
+
+
+def _visible_download_panels(page: Page):
+    """Open DOWNLOAD menus only. Hidden copies of the panel are ignored."""
+    loc = page.locator(_DOWNLOAD_MENU_PANEL)
+    found = []
     try:
-        count = min(loc.count(), 40)
+        count = loc.count()
     except Exception:
-        return None
-    for i in range(count):
-        item = loc.nth(i)
+        return found
+    for i in range(min(count, 6)):
+        panel = loc.nth(i)
         try:
-            if not item.is_visible():
-                continue
-            text = " ".join((item.inner_text(timeout=1000) or "").split())
+            if panel.is_visible():
+                found.append(panel)
         except Exception:
             continue
-        if not text or "transaction" in text.lower() or not pattern.search(text):
+    return found
+
+
+def _download_panel_text(page: Page) -> str:
+    parts: list[str] = []
+    for panel in _visible_download_panels(page):
+        try:
+            text = " ".join((panel.inner_text(timeout=800) or "").split())
+        except Exception:
             continue
-        if len(text) < best_len:
-            best = item
-            best_len = len(text)
-    return best
+        if text:
+            parts.append(text)
+    return " | ".join(parts)
+
+
+def _shipment_report_menu_item(page: Page, cfg: dict[str, Any] | None = None):
+    """Visible DOWNLOAD-menu row for the xlsx shipment report, not Transaction report."""
+    configured = _sel(cfg or {}, "shipment_report_menu", "") if cfg else ""
+    if configured:
+        try:
+            item = page.locator(configured).first
+            if item.is_visible():
+                text = " ".join((item.inner_text(timeout=800) or "").split())
+                if text and "transaction" not in text.lower() and _SHIPMENT_REPORT_RE.search(text):
+                    return item
+        except Exception:
+            pass
+    try:
+        item = page.get_by_role("menuitem", name=_SHIPMENT_REPORT_RE).first
+        if item.is_visible():
+            text = " ".join((item.inner_text(timeout=800) or "").split())
+            if text and "transaction" not in text.lower():
+                return item
+    except Exception:
+        pass
+    for panel in _visible_download_panels(page):
+        rows = panel.locator(
+            "[role='menuitem'], .mat-mdc-menu-item, .mat-menu-item, button, a"
+        ).filter(has_text=_SHIPMENT_REPORT_RE)
+        try:
+            count = min(rows.count(), 6)
+        except Exception:
+            continue
+        for i in range(count):
+            item = rows.nth(i)
+            try:
+                if not item.is_visible():
+                    continue
+                text = " ".join((item.inner_text(timeout=800) or "").split())
+            except Exception:
+                continue
+            if text and "transaction" not in text.lower() and _SHIPMENT_REPORT_RE.search(text):
+                return item
+    return None
+
+
+def _wait_for_shipment_report_item(
+    page: Page, cfg: dict[str, Any], seconds: float
+) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if _shipment_report_menu_item(page, cfg) is not None:
+            return True
+        page.wait_for_timeout(300)
+    return False
 
 
 def _click_download_toolbar(page: Page, cfg: dict[str, Any]) -> None:
-    if not _click_first(page, _download_button_selector(cfg), timeout_ms=15_000):
+    selector = _download_button_selector(cfg)
+    try:
+        page.locator(selector).first.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    if not _click_first(page, selector, timeout_ms=15_000):
         raise FedexBatchError("Could not click DOWNLOAD on the shipment list.")
 
 
+def _raise_if_download_menu_empty(page: Page, cfg: dict[str, Any]) -> None:
+    """The popup is up. Give it a few seconds, then stop if it has no choices.
+
+    Clicking DOWNLOAD again reopens the same blank box. It does not create
+    the Shipment report row.
+    """
+    if _wait_for_shipment_report_item(page, cfg, 4):
+        return
+    shown = _download_panel_text(page) or "(empty)"
+    raise DownloadMenuEmpty(
+        "DOWNLOAD menu is open but has no choices. "
+        f"Menu showed: {shown[:240]}"
+    )
+
+
 def _open_download_menu(page: Page, cfg: dict[str, Any]) -> None:
-    if _shipment_report_menu_item(page) is not None:
+    """Open DOWNLOAD and require Shipment report to be in the menu."""
+    if _shipment_report_menu_item(page, cfg) is not None:
+        return
+    if _visible_download_panels(page):
+        _log("DOWNLOAD menu is already open.")
+        _raise_if_download_menu_empty(page, cfg)
         return
     _click_download_toolbar(page, cfg)
-    deadline = time.monotonic() + 8.0
+    deadline = time.monotonic() + 8
     while time.monotonic() < deadline:
-        if _shipment_report_menu_item(page) is not None:
+        if _shipment_report_menu_item(page, cfg) is not None:
             return
-        page.wait_for_timeout(200)
-    raise FedexBatchError("DOWNLOAD was clicked but the Shipment report choice did not appear.")
+        if _visible_download_panels(page):
+            _log("DOWNLOAD menu opened.")
+            _raise_if_download_menu_empty(page, cfg)
+            return
+        page.wait_for_timeout(250)
+    raise FedexBatchError("DOWNLOAD was clicked but the menu did not open.")
+
+
+def _reload_shipment_list_for_report(page: Page, cfg: dict[str, Any]) -> None:
+    _log(
+        "DOWNLOAD opened an empty box. Clicking it again does not add Shipment report. "
+        "Reloading the shipment list and selecting the rows again."
+    )
+    page.reload(wait_until="domcontentloaded", timeout=120_000)
+    page.wait_for_timeout(1500)
+    if _retry_button_visible(page, cfg):
+        raise FedexBatchError(
+            "Shipment list reloaded onto FedEx's Retry page, so the report was not downloaded."
+        )
+    _wait_for_shipment_list_loaded(page, cfg, min_rows=1, timeout_ms=60_000)
 
 
 def _close_download_menu(page: Page, cfg: dict[str, Any]) -> None:
     """Toggle DOWNLOAD shut. Escape can also clear the selected shipments."""
-    if _shipment_report_menu_item(page) is None:
+    if not _visible_download_panels(page) and _shipment_report_menu_item(page, cfg) is None:
         return
     try:
         _click_download_toolbar(page, cfg)
-        page.wait_for_timeout(300)
     except Exception:
-        pass
+        return
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not _visible_download_panels(page):
+            return
+        page.wait_for_timeout(150)
 
 
 def _click_shipment_report_choice(item) -> str:
@@ -3470,6 +3645,7 @@ def _download_shipment_report_xlsx(page: Page, cfg: dict[str, Any], dest: Path) 
     selected = _select_all_shipment_rows(page, cfg)
     if selected == 0:
         raise FedexBatchError("No shipment rows to include in the report.")
+    page.wait_for_timeout(1000)
 
     captured: list[Any] = []
 
@@ -3480,18 +3656,33 @@ def _download_shipment_report_xlsx(page: Page, cfg: dict[str, Any], dest: Path) 
     download_dirs = _browser_download_dirs()
     per_try_s = min(60.0, max(20.0, timeout_ms / 1000.0 / 2))
     local_copy: Path | None = None
+    reloaded_for_empty_menu = False
     try:
         for attempt in range(1, 4):
-            _close_download_menu(page, cfg)
+            if attempt > 1:
+                _close_download_menu(page, cfg)
             started = time.time()
             captured.clear()
             try:
                 _open_download_menu(page, cfg)
+            except DownloadMenuEmpty as exc:
+                if reloaded_for_empty_menu:
+                    raise
+                _log(f"WARN: {exc}")
+                _reload_shipment_list_for_report(page, cfg)
+                selected = _select_all_shipment_rows(page, cfg)
+                if selected == 0:
+                    raise FedexBatchError(
+                        "No shipment rows to include in the report after reload."
+                    )
+                page.wait_for_timeout(1000)
+                reloaded_for_empty_menu = True
+                continue
             except FedexBatchError as exc:
                 _log(f"WARN: shipment report menu attempt {attempt}: {exc}")
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(1000)
                 continue
-            item = _shipment_report_menu_item(page)
+            item = _shipment_report_menu_item(page, cfg)
             if item is None:
                 _log(
                     f"WARN: Shipment report row was not visible in the DOWNLOAD menu "
