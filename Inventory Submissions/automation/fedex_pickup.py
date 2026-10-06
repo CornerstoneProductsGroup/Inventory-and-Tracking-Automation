@@ -10,7 +10,8 @@ Two pickups, each optional:
 Totals come from the same ``Lowe's M-D-YYYY Output.csv`` the FedEx batch uploads:
 column AB = packages (labels) for the row, AC = total weight for the row, AG = SKU.
 
-Standalone on purpose: nothing in ``fedex_batch_shipping.run_fedex_batch`` calls this yet.
+All Steps runs this after the other workflow phases (``run_fedex_pickup.py --no-wait``).
+The FedEx batch label run does not call it.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import re
 import sys
 import time
 import csv
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,7 @@ from automation.warehouse_print_vendors import (
 
 _INVENTORY_ROOT = Path(__file__).resolve().parent.parent
 _STATE_PATH = _INVENTORY_ROOT / "fedex_pickup_state.json"
+_LAST_RUN_PATH = _INVENTORY_ROOT / "fedex_pickup_last_run.json"
 _SCREENSHOT_DIR = _INVENTORY_ROOT / "screenshots" / "fedex_pickup"
 
 DEFAULT_PICKUP_URL = "https://www.fedex.com/shippingplus/en-us/pickup/schedule-pickup"
@@ -59,6 +61,122 @@ WAREHOUSE = "warehouse"
 POSTPROTECTOR = "postprotector"
 LOCATIONS = (WAREHOUSE, POSTPROTECTOR)
 LOCATION_LABELS = {WAREHOUSE: "Our Warehouse", POSTPROTECTOR: "Post Protector"}
+
+_OK_STATUSES = frozenset({"confirmed", "already_booked"})
+_ISSUE_STATUSES = frozenset({"error", "submitted_unconfirmed"})
+
+
+@dataclass
+class PickupLocationResult:
+    location: str
+    label: str
+    packages: int
+    status: str
+    confirmation: str = ""
+    detail: str = ""
+
+
+@dataclass
+class PickupRunReport:
+    """What All Steps prints after the other phases stop."""
+
+    csv_name: str = ""
+    pickup_date: str = ""
+    locations: list[PickupLocationResult] = field(default_factory=list)
+    fatal_error: str = ""
+    kind: str = ""
+
+    def exit_code(self) -> int:
+        if self.kind == "no_csv":
+            return 0
+        if self.fatal_error:
+            return 1
+        if any(loc.status in _ISSUE_STATUSES for loc in self.locations):
+            return 1
+        return 0
+
+    def section_lines(self) -> list[str]:
+        if self.kind == "no_csv":
+            return [f"  {self.fatal_error or 'No Lowe\'s Output CSV for today — nothing to schedule.'}"]
+        if self.fatal_error and not self.locations:
+            return [f"  Could not schedule pickups: {self.fatal_error}"]
+        lines = [_location_section_line(loc) for loc in self.locations]
+        lines.append(_pickup_headline(self.locations))
+        return lines
+
+    def save(self) -> None:
+        payload = {
+            "csv": self.csv_name,
+            "pickup_date": self.pickup_date,
+            "fatal_error": self.fatal_error,
+            "kind": self.kind,
+            "locations": [asdict(loc) for loc in self.locations],
+            "section_lines": self.section_lines(),
+        }
+        _LAST_RUN_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _location_section_line(loc: PickupLocationResult) -> str:
+    pkg = f"{loc.packages} package(s)"
+    if loc.status == "no_packages":
+        return f"  {loc.label}: {pkg} — nothing to schedule"
+    if loc.status == "already_booked":
+        conf = f" (confirmation {loc.confirmation})" if loc.confirmation else ""
+        return f"  {loc.label}: {pkg} — already scheduled{conf}"
+    if loc.status == "confirmed":
+        conf = f" (confirmation {loc.confirmation})" if loc.confirmation else ""
+        return f"  {loc.label}: {pkg} — scheduled successfully{conf}"
+    if loc.status == "submitted_unconfirmed":
+        return f"  {loc.label}: {pkg} — issue: submitted, but no confirmation number was found"
+    if loc.status == "dry_run":
+        return f"  {loc.label}: {pkg} — dry run only (not scheduled)"
+    if loc.status == "plan_only":
+        return f"  {loc.label}: {pkg} — plan only (not scheduled)"
+    detail = loc.detail or "could not schedule"
+    return f"  {loc.label}: {pkg} — issue: {detail}"
+
+
+def _pickup_headline(locations: list[PickupLocationResult]) -> str:
+    if not locations:
+        return "  FedEx pickup did not produce a result."
+    ok = [loc for loc in locations if loc.status in _OK_STATUSES]
+    issues = [loc for loc in locations if loc.status in _ISSUE_STATUSES]
+    empty = [loc for loc in locations if loc.status == "no_packages"]
+    if len(ok) == len(locations) and len(locations) >= 2:
+        return "  Both pickups scheduled successfully."
+    if len(issues) == len(locations) and len(locations) >= 2:
+        return "  Both pickups had an issue."
+    if len(ok) == 1 and len(locations) == 1:
+        return f"  {ok[0].label} scheduled successfully."
+    if issues and ok:
+        bad = " and ".join(loc.label for loc in issues)
+        good = " and ".join(loc.label for loc in ok)
+        return f"  {bad} had an issue. {good} scheduled successfully."
+    if issues and empty and not ok:
+        bad = " and ".join(loc.label for loc in issues)
+        none = " and ".join(loc.label for loc in empty)
+        return f"  {bad} had an issue. {none} had no packages."
+    if ok and empty and not issues:
+        good = " and ".join(loc.label for loc in ok)
+        none = " and ".join(loc.label for loc in empty)
+        return f"  {good} scheduled successfully. {none} had no packages."
+    if empty and not ok and not issues and len(empty) == len(locations):
+        return "  No packages to schedule for either pickup."
+    dry = [loc for loc in locations if loc.status in ("dry_run", "plan_only")]
+    if dry and len(dry) == len(locations):
+        return "  Dry run only — pickups were not scheduled."
+    return "  See each pickup above."
+
+
+def print_pickup_closing(report: PickupRunReport) -> None:
+    if os.environ.get("FEDEX_PICKUP_SUPPRESS_SECTION", "").strip().lower() in ("1", "true", "yes"):
+        return
+    bar = "=" * 60
+    print(f"\n{bar}\nFEDEX PICKUP\n{bar}", flush=True)
+    for line in report.section_lines():
+        print(line, flush=True)
+    print(bar, flush=True)
+
 
 DEFAULT_PICKUP_SETTINGS: dict[str, Any] = {
     "pickup_url": DEFAULT_PICKUP_URL,
@@ -803,34 +921,59 @@ def run_fedex_pickups(
     manual_login: bool = False,
     skip_auto_login: bool = False,
     wait_at_end: bool = True,
-) -> int:
+) -> PickupRunReport:
     settings = load_pickup_settings(pickup_settings_path)
     upload_csv = resolve_upload_csv(order_date=order_date, explicit_path=csv_path)
     plan = build_pickup_plan(upload_csv, settings, pickup_date=pickup_date)
     print_pickup_plan(plan, locations)
 
+    report = PickupRunReport(
+        csv_name=upload_csv.name,
+        pickup_date=plan.pickup_date.isoformat(),
+    )
     todo: list[str] = []
     for loc in locations:
         t = plan.totals[loc]
         if t.packages <= 0:
+            report.locations.append(
+                PickupLocationResult(loc, t.label, 0, "no_packages")
+            )
             _log(f"{t.label}: no packages today — skipping.")
             continue
         booked = get_booked(plan.pickup_date, loc)
         if booked and not force and not dry_run:
+            report.locations.append(
+                PickupLocationResult(
+                    loc,
+                    t.label,
+                    t.packages,
+                    "already_booked",
+                    confirmation=str(booked.get("confirmation") or ""),
+                )
+            )
             _log(
                 f"{t.label}: already booked for {plan.pickup_date.isoformat()} "
                 f"({booked.get('status')}, confirmation {booked.get('confirmation') or 'n/a'}). "
                 "Skipping — use --force to book again."
             )
             continue
+        report.locations.append(
+            PickupLocationResult(loc, t.label, t.packages, "pending")
+        )
         todo.append(loc)
+    report.save()
 
     if plan_only:
+        for item in report.locations:
+            if item.status == "pending":
+                item.status = "plan_only"
         _log("Plan only — FedEx not opened.")
-        return 0
+        report.save()
+        return report
     if not todo:
         _log("Nothing to schedule.")
-        return 0
+        report.save()
+        return report
 
     cfg = _load_config(config_path)
     manual_login = manual_login or (os.environ.get("FEDEX_MANUAL_LOGIN", "").strip().lower() in ("1", "true", "yes"))
@@ -843,7 +986,14 @@ def run_fedex_pickups(
             creds = load_fedex_credentials(cfg)
             _log(f"FedEx credentials loaded for {creds.username!r} (from {env_file_path()})")
         except ValueError as exc:
-            raise FedexPickupError(str(exc)) from exc
+            for item in report.locations:
+                if item.status == "pending":
+                    item.status = "error"
+                    item.detail = str(exc)
+            report.fatal_error = str(exc)
+            report.save()
+            _log(f"ERROR: {exc}")
+            return report
 
     browser_cfg = cfg.get("browser", {})
     slow_mo = int(browser_cfg.get("slow_mo_ms", 0))
@@ -851,7 +1001,52 @@ def run_fedex_pickups(
     mode = "DRY RUN (will stop before SCHEDULE PICKUP)" if dry_run else "LIVE (will submit)"
     _log(f"Mode: {mode}. Pickups: {', '.join(LOCATION_LABELS[l] for l in todo)}")
 
-    failures = 0
+    by_location = {item.location: item for item in report.locations}
+    try:
+        _run_pickup_browser(
+            cfg,
+            creds,
+            settings,
+            plan,
+            report,
+            by_location,
+            todo,
+            upload_csv_name=upload_csv.name,
+            dry_run=dry_run,
+            manual_login=manual_login,
+            skip_auto_login=skip_auto_login,
+            wait_at_end=wait_at_end,
+            slow_mo=slow_mo,
+            default_timeout=default_timeout,
+        )
+    except Exception as exc:
+        _log(f"ERROR: {exc}")
+        for item in report.locations:
+            if item.status == "pending":
+                item.status = "error"
+                item.detail = str(exc)
+        report.fatal_error = str(exc)
+    report.save()
+    return report
+
+
+def _run_pickup_browser(
+    cfg: dict[str, Any],
+    creds: FedexCredentials | None,
+    settings: dict[str, Any],
+    plan: PickupPlan,
+    report: PickupRunReport,
+    by_location: dict[str, PickupLocationResult],
+    todo: list[str],
+    *,
+    upload_csv_name: str,
+    dry_run: bool,
+    manual_login: bool,
+    skip_auto_login: bool,
+    wait_at_end: bool,
+    slow_mo: int,
+    default_timeout: int,
+) -> None:
     with sync_playwright() as p:
         browser, context, page, persistent = _open_fedex_browser(
             p, cfg, headless=False, slow_mo=slow_mo
@@ -863,6 +1058,7 @@ def run_fedex_pickups(
             )
             for loc in todo:
                 totals = plan.totals[loc]
+                item = by_location[loc]
                 _log(f"===== {totals.label} =====")
                 try:
                     _open_pickup_form(page, cfg, settings)
@@ -879,6 +1075,8 @@ def run_fedex_pickups(
                     actual_date = _fill_pickup_details(page, totals, settings, plan.pickup_date)
 
                     if dry_run:
+                        item.status = "dry_run"
+                        report.save()
                         _screenshot(page, loc, "dry_run")
                         _log(f"{totals.label}: DRY RUN complete — SCHEDULE PICKUP not clicked.")
                         if wait_at_end:
@@ -894,10 +1092,15 @@ def run_fedex_pickups(
                             "pickup_date": actual_date.isoformat(),
                             "packages": totals.packages,
                             "weight_lb": totals.weight_for_form,
-                            "csv": upload_csv.name,
+                            "csv": upload_csv_name,
                         }
                     )
                     record_booking(plan.pickup_date, loc, result)
+                    item.status = str(result.get("status") or "submitted_unconfirmed")
+                    item.confirmation = str(result.get("confirmation") or "")
+                    if item.status != "confirmed":
+                        item.detail = "submitted, but no confirmation number was found"
+                    report.save()
                     if result["status"] == "confirmed":
                         _log(f"{totals.label}: BOOKED — confirmation {result['confirmation']}")
                     else:
@@ -908,7 +1111,9 @@ def run_fedex_pickups(
                     if wait_at_end:
                         _wait_for_enter("Press Enter to continue… ")
                 except Exception as exc:
-                    failures += 1
+                    item.status = "error"
+                    item.detail = str(exc)
+                    report.save()
                     _log(f"ERROR ({totals.label}): {exc}")
                     _screenshot(page, loc, "error")
                     if wait_at_end:
@@ -919,5 +1124,3 @@ def run_fedex_pickups(
             context.close()
             if browser is not None:
                 browser.close()
-
-    return 1 if failures else 0

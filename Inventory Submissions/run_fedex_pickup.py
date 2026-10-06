@@ -109,12 +109,17 @@ def main() -> int:
         return 1
 
     from automation.fedex_lowes_csv import LowesCsvSkip
-    from automation.fedex_pickup import LOCATIONS, run_fedex_pickups
+    from automation.fedex_pickup import (
+        LOCATIONS,
+        PickupRunReport,
+        print_pickup_closing,
+        run_fedex_pickups,
+    )
 
     locations = list(LOCATIONS) if args.location == "both" else [args.location]
 
     try:
-        return run_fedex_pickups(
+        report = run_fedex_pickups(
             config_path=args.config.resolve(),
             pickup_settings_path=args.pickup_config.resolve() if args.pickup_config else None,
             locations=locations,
@@ -129,11 +134,23 @@ def main() -> int:
             wait_at_end=not args.no_wait,
         )
     except LowesCsvSkip as skip:
-        print(f"[fedex/pickup] No Lowe's Output CSV for today (newest is {skip.top_filename!r}) — nothing to schedule.")
+        message = (
+            f"No Lowe's Output CSV for today (newest is {skip.top_filename!r}) — nothing to schedule."
+        )
+        print(f"[fedex/pickup] {message}")
+        report = PickupRunReport(kind="no_csv", fatal_error=message)
+        report.save()
+        print_pickup_closing(report)
         return 0
     except Exception as exc:
         print(f"ERROR: {exc}")
+        report = PickupRunReport(fatal_error=str(exc))
+        report.save()
+        print_pickup_closing(report)
         return 1
+
+    print_pickup_closing(report)
+    return report.exit_code()
 
 
 if __name__ == "__main__":

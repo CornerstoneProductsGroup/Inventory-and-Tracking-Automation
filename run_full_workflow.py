@@ -14,6 +14,10 @@ Two independent lanes run in parallel (default); neither waits on the other:
 
   **SPS Commerce** — one browser: Tractor inventory, Tractor + Grainger tracking/invoicing.
 
+  **FedEx pickup** (All Steps only) — after the other phases, schedule next-day Ground
+  pickups for Our Warehouse and Post Protector. The command window ends with a
+  FEDEX PICKUP section (package counts and whether each pickup scheduled).
+
 Use ``--sequential-lanes`` to run CommerceHub fully, then SPS.
 
 Optional skips: --skip-commercehub, --skip-sps-inventory, --skip-sps-tracking,
@@ -41,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import os
 import shutil
 import subprocess
@@ -251,10 +256,105 @@ def _workflow_report_finish(errors: list[str], *, success: bool) -> None:
             print("\nAll workflow steps completed successfully.")
 
 
-def _finish_and_return(code: int, errors: list[str] | None = None) -> int:
+def _finish_and_return(
+    code: int,
+    errors: list[str] | None = None,
+    *,
+    show_fedex_pickup: bool = False,
+) -> int:
     errs = errors or []
     _workflow_report_finish(errs, success=(code == 0 and not errs))
+    if show_fedex_pickup:
+        _print_fedex_pickup_closing()
     return code
+
+
+def _fedex_pickup_last_run_path() -> Path:
+    return INVENTORY_DIR / "fedex_pickup_last_run.json"
+
+
+def _print_fedex_pickup_closing() -> None:
+    """Last block in the All Steps window: package counts and schedule result."""
+    bar = "=" * 60
+    print(f"\n{bar}\nFEDEX PICKUP\n{bar}", flush=True)
+    path = _fedex_pickup_last_run_path()
+    lines: list[str] = []
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            raw = data.get("section_lines") if isinstance(data, dict) else None
+            if isinstance(raw, list):
+                lines = [str(line) for line in raw if str(line).strip()]
+        except (OSError, json.JSONDecodeError) as exc:
+            lines = [f"  Could not read the pickup result: {exc}"]
+    if not lines:
+        lines = [
+            "  FedEx pickup did not finish — no result was saved.",
+            "  Check the log above for the error.",
+        ]
+    for line in lines:
+        print(line, flush=True)
+    print(bar, flush=True)
+
+
+def _run_fedex_pickup_phase(python_exe: str) -> str | None:
+    script = INVENTORY_DIR / "run_fedex_pickup.py"
+    if not script.is_file():
+        message = f"Missing FedEx pickup script: {script}"
+        _fedex_pickup_last_run_path().write_text(
+            json.dumps(
+                {
+                    "fatal_error": message,
+                    "section_lines": [f"  Could not schedule pickups: {message}"],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return f"FedEx pickup: {message}"
+
+    os.environ["FEDEX_PICKUP_SUPPRESS_SECTION"] = "1"
+    try:
+        ok, err = run_step(
+            "FedEx Pickup — next-day Ground (Our Warehouse and Post Protector)",
+            [python_exe, str(script), "--location", "both", "--no-wait"],
+            INVENTORY_DIR,
+        )
+    finally:
+        os.environ.pop("FEDEX_PICKUP_SUPPRESS_SECTION", None)
+    if ok:
+        return None
+    detail = _fedex_pickup_error_detail(err or "exit code 1")
+    if not _fedex_pickup_last_run_path().is_file():
+        detail = err or "exit code 1"
+        _fedex_pickup_last_run_path().write_text(
+            json.dumps(
+                {
+                    "fatal_error": detail,
+                    "section_lines": [f"  Could not schedule pickups: {detail}"],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return f"FedEx pickup: {detail}"
+    return f"FedEx pickup: {detail}"
+
+
+def _fedex_pickup_error_detail(fallback: str) -> str:
+    path = _fedex_pickup_last_run_path()
+    if not path.is_file():
+        return fallback
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback
+    lines = data.get("section_lines") if isinstance(data, dict) else None
+    if isinstance(lines, list) and lines:
+        headline = str(lines[-1]).strip()
+        if headline:
+            return headline
+    return fallback
 
 
 def run_step(title: str, cmd: list[str], cwd: Path) -> tuple[bool, str]:
@@ -687,6 +787,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--with-fedex-pickup",
+        action="store_true",
+        help=(
+            "After the other All Steps phases, schedule FedEx Ground pickups for "
+            "Our Warehouse and Post Protector, then print a FEDEX PICKUP section."
+        ),
+    )
+    parser.add_argument(
         "--sequential-lanes",
         action="store_true",
         help="Within each phase, run CommerceHub then SPS one after the other instead of parallel.",
@@ -808,6 +916,7 @@ def main() -> int:
     amazon_seller_download_only = bool(args.amazon_seller_download_only)
     vendor_emails_only = bool(args.vendor_emails_only)
     with_vendor_emails = bool(args.with_vendor_emails)
+    with_fedex_pickup = bool(args.with_fedex_pickup)
     grainger_only = bool(args.grainger_only)
     invoice_report_only = bool(args.invoice_report_only)
     skip_inventory = bool(args.skip_inventory) or tracking_invoicing_only
@@ -1246,7 +1355,12 @@ def main() -> int:
             )
         )
 
-    return _finish_and_return(1 if errors else 0, errors)
+    if with_fedex_pickup:
+        pickup_error = _run_fedex_pickup_phase(python_exe)
+        if pickup_error:
+            errors.append(pickup_error)
+
+    return _finish_and_return(1 if errors else 0, errors, show_fedex_pickup=with_fedex_pickup)
 
 
 if __name__ == "__main__":

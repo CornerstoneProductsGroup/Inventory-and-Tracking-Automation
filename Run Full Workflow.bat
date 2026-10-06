@@ -19,7 +19,7 @@ echo   W  WorldShip / UPS shipping
 echo   O  Vendor Emails ^(Outlook — ALL or pick one vendor^)
 echo   0  Pull Orders ^(CommerceHub PDF/CSV, SPS, warehouse print^)
 echo   S  Scheduled morning chain ^(see SCHEDULED_WORKFLOW.md^)
-echo   1  All Steps ^(vendor emails, invoice reports, inventories, tracking/invoicing^)
+echo   1  All Steps ^(vendor emails, invoice reports, inventories, tracking/invoicing, FedEx pickups^)
 echo   T  Tracking / Invoicing ^(submenu^)
 echo   I  Inventory ^(submenu^)
 echo   R  Invoice Reports ^(submenu^)
@@ -133,7 +133,7 @@ goto RUN
 goto RUN_SCHEDULED
 
 :OPT_1
-set "EXTRA_ARGS=--with-vendor-emails --invoice-report-modes all --run-grainger-all"
+set "EXTRA_ARGS=--with-vendor-emails --invoice-report-modes all --run-grainger-all --with-fedex-pickup"
 goto RUN
 
 :OPT_9
