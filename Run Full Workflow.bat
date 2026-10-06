@@ -20,6 +20,7 @@ echo   O  Vendor Emails ^(Outlook — ALL or pick one vendor^)
 echo   0  Pull Orders ^(CommerceHub PDF/CSV, SPS, warehouse print^)
 echo   S  Scheduled morning chain ^(see SCHEDULED_WORKFLOW.md^)
 echo   1  All Steps ^(vendor emails, invoice reports, inventories, tracking/invoicing, FedEx pickups^)
+echo   2  All Steps WITHOUT vendor emails ^(same as 1, use when emails were already sent^)
 echo   T  Tracking / Invoicing ^(submenu^)
 echo   I  Inventory ^(submenu^)
 echo   R  Invoice Reports ^(submenu^)
@@ -28,9 +29,10 @@ echo   P  FedEx Pickups ^(schedule next-day Ground pickups — Warehouse / Post 
 echo.
 echo Invoice reports need commercehub_invoice_export.py in "invoice report" folder.
 echo.
-choice /C FWO01TIR9SP /N /M "Press F, W, O, 0, 1, T, I, R, 9, S, or P: "
-REM choice sets ERRORLEVEL to key index: F=1 W=2 O=3 0=4 1=5 T=6 I=7 R=8 9=9 S=10 P=11
+choice /C FWO01TIR9SP2 /N /M "Press F, W, O, 0, 1, 2, T, I, R, 9, S, or P: "
+REM choice sets ERRORLEVEL to key index: F=1 W=2 O=3 0=4 1=5 T=6 I=7 R=8 9=9 S=10 P=11 2=12
 REM "if errorlevel N" means ERRORLEVEL >= N — test highest index first.
+if errorlevel 12 goto OPT_2
 if errorlevel 11 goto SUBMENU_PICKUP
 if errorlevel 10 goto OPT_S
 if errorlevel 9 goto OPT_9
@@ -134,6 +136,11 @@ goto RUN_SCHEDULED
 
 :OPT_1
 set "EXTRA_ARGS=--with-vendor-emails --invoice-report-modes all --run-grainger-all --with-fedex-pickup"
+goto RUN
+
+:OPT_2
+REM Same as All Steps (1) but without --with-vendor-emails
+set "EXTRA_ARGS=--invoice-report-modes all --run-grainger-all --with-fedex-pickup"
 goto RUN
 
 :OPT_9
