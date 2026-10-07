@@ -822,18 +822,67 @@ def _show_vendor_email_popup(rows: list[tuple[str, bool, str]]) -> None:
             lines.append("  (none)")
     text = "\n".join(lines)
     _log(text.replace("\n", " | "))
+    if _spawn_detached_popup(text, "Vendor emails"):
+        _log("Summary window opened; continuing without waiting for OK.")
+        return
     try:
         import ctypes
 
-        # OK + information icon + foreground + topmost, so it sits over the menu.
+        # Fallback: blocking dialog (waits for OK) if a separate window could not be started.
         ctypes.windll.user32.MessageBoxW(
             0,
             text,
             "Vendor emails",
-            0x00000040 | 0x00010000 | 0x00040000,
+            _POPUP_FLAGS,
         )
     except Exception as exc:
         _log(f"WARN: could not open the vendor email summary window: {exc}")
+
+
+# OK + information icon + foreground + topmost, so it sits over the menu.
+_POPUP_FLAGS = 0x00000040 | 0x00010000 | 0x00040000
+
+_POPUP_SCRIPT = (
+    "import ctypes, sys; "
+    "ctypes.windll.user32.MessageBoxW(0, sys.argv[1], sys.argv[2], int(sys.argv[3]))"
+)
+
+
+def _spawn_detached_popup(text: str, title: str) -> bool:
+    """
+    Show the summary in its own process so this script (and All Steps) keeps going.
+
+    The window stays open until someone clicks OK. Output handles are not inherited,
+    so the parent workflow does not wait on the popup process.
+    """
+    if os.name != "nt":
+        return False
+    import subprocess
+    import sys
+
+    exe = Path(sys.executable)
+    pythonw = exe.with_name("pythonw.exe")
+    runner = str(pythonw if pythonw.is_file() else exe)
+    flags = 0
+    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
+        flags |= getattr(subprocess, name, 0)
+    cmd = [runner, "-c", _POPUP_SCRIPT, text, title, str(_POPUP_FLAGS)]
+    kwargs = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    for creationflags in (flags, flags & ~getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)):
+        try:
+            subprocess.Popen(cmd, creationflags=creationflags, **kwargs)
+            return True
+        except OSError:
+            continue
+        except Exception as exc:
+            _log(f"WARN: could not start summary window process: {exc}")
+            return False
+    return False
 
 
 def send_vendor_emails(
