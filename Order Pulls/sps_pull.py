@@ -122,6 +122,38 @@ def app_frame(page):
     raise RuntimeError("SPS Fulfillment app frame not found")
 
 
+# SPS often puts the sign-in form in an iframe, and the address can already be
+# /fulfillment while that form is still on screen.
+USERNAME_SELECTORS = (
+    "input[name='username']",
+    "input#username",
+    "input[type='email']",
+    "input[name='email']",
+    "input[name='identifier']",
+    "input#okta-signin-username",
+)
+PASSWORD_SELECTORS = (
+    "input[name='password']",
+    "input#password",
+    "input[type='password']",
+)
+NEXT_SELECTORS = (
+    "button._button-login-id",
+    "button[type='submit']",
+    "button:has-text('Continue')",
+    "button:has-text('Next')",
+    "button:has-text('Log in')",
+    "button:has-text('Sign in')",
+)
+SUBMIT_SELECTORS = (
+    "button._button-login-password",
+    "button[type='submit']",
+    "button:has-text('Continue')",
+    "button:has-text('Sign in')",
+    "button:has-text('Log in')",
+)
+
+
 def _env_credentials() -> tuple[str, str]:
     try:
         from dotenv import load_dotenv
@@ -132,52 +164,133 @@ def _env_credentials() -> tuple[str, str]:
     return (os.getenv("SPS_USERNAME") or "").strip(), (os.getenv("SPS_PASSWORD") or "").strip()
 
 
-def _login_form_visible(page) -> bool:
-    try:
-        return page.locator("input[name='username']").first.is_visible()
-    except Exception:
+def _find_visible(page, selectors):
+    """First visible match on the page or in any frame. Returns (frame, locator)."""
+    for frame in page.frames:
+        for sel in selectors:
+            try:
+                loc = frame.locator(sel).first
+                if loc.count() and loc.is_visible():
+                    return frame, loc
+            except Exception:
+                continue
+    return None, None
+
+
+def _click_visible(page, selectors) -> bool:
+    frame, loc = _find_visible(page, selectors)
+    if loc is None:
         return False
+    try:
+        loc.click(timeout=5_000)
+    except Exception:
+        loc.click(timeout=5_000, force=True)
+    return True
+
+
+def _looks_like_login_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(x in u for x in ("login", "signin", "sign-in", "/auth", "sso", "okta", "microsoftonline", "adfs"))
+
+
+def _login_form_visible(page) -> bool:
+    if _find_visible(page, USERNAME_SELECTORS)[1] is not None:
+        return True
+    if _find_visible(page, PASSWORD_SELECTORS)[1] is not None:
+        return True
+    return _looks_like_login_url(page.url)
+
+
+def _app_ready(page) -> bool:
+    """True only when the Fulfillment app is up, not merely when the address says /fulfillment."""
+    if _looks_like_login_url(page.url) or _find_visible(page, USERNAME_SELECTORS + PASSWORD_SELECTORS)[1] is not None:
+        return False
+    url = (page.url or "").lower()
+    if "commerce.spscommerce.com" not in url:
+        return False
+    for frame in page.frames:
+        try:
+            tile = frame.get_by_text(re.compile(r"New\s+Orders"))
+            if tile.count() and tile.first.is_visible():
+                return True
+        except Exception:
+            continue
+    return "/home/apps" in url
 
 
 def sign_in_with_env(page) -> bool:
-    """Type the Inventory Submissions/.env SPS login. Returns False if it is missing."""
+    """Type the Inventory Submissions/.env SPS login. Returns False if the form is not ready."""
     username, password = _env_credentials()
     if not username or not password:
         log.warning("Missing SPS_USERNAME or SPS_PASSWORD in %s", ENV_FILE)
         return False
-    log.info("Signing in to SPS with SPS_USERNAME from Inventory Submissions/.env")
-    page.locator("input[name='username']").wait_for(state="visible", timeout=30_000)
-    page.locator("input[name='username']").fill(username)
-    page.locator("button._button-login-id").click()
-    page.locator("input[name='password']").wait_for(state="visible", timeout=30_000)
-    page.locator("input[name='password']").fill(password)
-    page.locator("button._button-login-password").click()
+    _frame, user = _find_visible(page, USERNAME_SELECTORS)
+    if user is None:
+        return False
+    log.info("Signing in to SPS with SPS_USERNAME from Inventory Submissions/.env (%s)", page.url)
+    user.click(timeout=3_000)
+    user.fill("")
+    user.fill(username)
+    if not _click_visible(page, NEXT_SELECTORS):
+        user.press("Enter")
+    _frame, pwd = None, None
+    for _ in range(30):
+        _frame, pwd = _find_visible(page, PASSWORD_SELECTORS)
+        if pwd is not None:
+            break
+        page.wait_for_timeout(500)
+    if pwd is None:
+        raise RuntimeError("SPS accepted the username step but the password field never appeared")
+    pwd.click(timeout=3_000)
+    pwd.fill("")
+    pwd.fill(password)
+    if not _click_visible(page, SUBMIT_SELECTORS):
+        pwd.press("Enter")
     page.wait_for_load_state("domcontentloaded")
     return True
 
 
 def ensure_logged_in(page):
-    page.goto(DASHBOARD_URL)
+    page.goto("https://commerce.spscommerce.com", wait_until="domcontentloaded")
     deadline = dt.datetime.now() + dt.timedelta(minutes=LOGIN_WAIT_MINUTES)
     asked = False
-    tried_env = False
+    submitted = False
     while dt.datetime.now() < deadline:
-        if page.url.startswith("https://commerce.spscommerce.com/fulfillment") and not _login_form_visible(page):
-            return
-        if not tried_env and _login_form_visible(page):
-            tried_env = True
-            try:
-                if sign_in_with_env(page):
+        if _app_ready(page):
+            if not page.url.startswith(DASHBOARD_URL):
+                page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
+                page.wait_for_timeout(1500)
+                if not _app_ready(page) and _login_form_visible(page):
                     continue
+            return
+        if not submitted and _find_visible(page, USERNAME_SELECTORS)[1] is not None:
+            try:
+                submitted = sign_in_with_env(page)
             except Exception as exc:
                 log.error("SPS .env sign-in failed: %s", exc)
+            continue
+        if not submitted:
+            _click_visible(page, (
+                "a:has-text('Log in')",
+                "button:has-text('Log in')",
+                "a:has-text('Sign in')",
+                "button:has-text('Sign in')",
+                "a[href*='signin']",
+            ))
         if not asked:
             log.warning(
-                "Still on the SPS sign-in page. Finish it in the browser window, including any verification code (waiting %d min)...",
+                "SPS is not in Fulfillment yet (%s). Signing in from .env; finish any verification code in the browser (waiting %d min)...",
+                page.url,
                 LOGIN_WAIT_MINUTES,
             )
             asked = True
         page.wait_for_timeout(2000)
+    try:
+        (HERE / "sps_debug_login.html").write_text(page.content(), encoding="utf-8")
+        log.error("Login page snapshot: %s", HERE / "sps_debug_login.html")
+        log.error("Frame URLs: %s", [f.url for f in page.frames])
+    except Exception:
+        pass
     raise RuntimeError("Timed out waiting for SPS sign-in.")
 
 
@@ -517,7 +630,11 @@ def main():
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             str(BROWSER_PROFILE_DIR), headless=args.headless, accept_downloads=True,
-            viewport={"width": 1400, "height": 900})
+            viewport={"width": 1400, "height": 900},
+            args=[
+                "--disable-features=BlockThirdPartyCookies,TrackingProtection3pcd",
+                "--disable-blink-features=AutomationControlled",
+            ])
         ctx.add_init_script(CAPTURE_JS)
         net_pdfs = []
 
