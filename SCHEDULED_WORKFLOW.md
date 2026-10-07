@@ -4,7 +4,7 @@ Runs a fixed sequence of automation steps on a daily schedule (default **5:00 AM
 
 ## Default steps (in order)
 
-1. **Pull Orders** — CommerceHub PDF/CSV, SPS Tractor/Grainger, warehouse print  
+1. **Pull Orders** — CommerceHub PDF/CSV, then SPS Tractor/Grainger (`Order Pulls/`)  
 2. **FedEx Batch** — upload Lowe's CSV, finalize labels, save `Lowe's Fedex Master.xlsx`  
 3. **All Invoice Reports** — Depot, Lowe's, Tractor Supply (previous business day)  
 4. **All Inventories** — CommerceHub Rithum + SPS Tractor Supply (no tracking/invoicing)

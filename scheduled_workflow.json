@@ -10,7 +10,7 @@
   "steps": [
     {
       "id": "pull_orders",
-      "label": "Pull Orders — CommerceHub PDF/CSV, SPS, warehouse print",
+      "label": "Pull Orders — CommerceHub PDF/CSV, then SPS Tractor/Grainger",
       "enabled": true,
       "continue_on_error": false,
       "type": "workflow",

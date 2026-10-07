@@ -17,7 +17,7 @@ echo ============================================================
 echo   F  FedEx Batch ^(Lowe's CSV upload, finalize, labels^)
 echo   W  WorldShip / UPS shipping
 echo   O  Vendor Emails ^(Outlook — ALL or pick one vendor^)
-echo   0  Pull Orders ^(CommerceHub PDF/CSV, SPS, warehouse print^)
+echo   0  Pull Orders ^(submenu^)
 echo   S  Scheduled morning chain ^(see SCHEDULED_WORKFLOW.md^)
 echo   1  All Steps ^(vendor emails, invoice reports, inventories, tracking/invoicing, FedEx pickups^)
 echo   2  All Steps WITHOUT vendor emails ^(same as 1, use when emails were already sent^)
@@ -128,7 +128,31 @@ set "EXTRA_ARGS=--vendor-emails-only"
 goto RUN
 
 :OPT_0
+goto SUBMENU_PULL
+
+:SUBMENU_PULL
+cls
+echo.
+echo ============================================================
+echo   Pull Orders
+echo ============================================================
+echo   1  Run
+echo   2  Dry runs
+echo   0  Back to main menu
+echo.
+choice /C 012 /N /M "Press 0-2: "
+REM 0=1 1=2 2=3
+if errorlevel 3 goto PULL_DRY
+if errorlevel 2 goto PULL_RUN
+if errorlevel 1 goto MAIN_MENU
+goto SUBMENU_PULL
+
+:PULL_RUN
 set "EXTRA_ARGS=--pull-orders-only"
+goto RUN
+
+:PULL_DRY
+set "EXTRA_ARGS=--pull-orders-only --pull-orders-dry-run"
 goto RUN
 
 :OPT_S

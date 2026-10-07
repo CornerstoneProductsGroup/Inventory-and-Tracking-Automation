@@ -7,7 +7,7 @@ set "RUNNER=python"
 if exist "%INV_PY%" set "RUNNER=%INV_PY%"
 
 echo.
-echo Pull Orders — CommerceHub PDF/CSV, SPS Tractor/Grainger, warehouse print
+echo Pull Orders — CommerceHub PDF/CSV, then SPS Tractor/Grainger
 echo.
 "%RUNNER%" "run_pull_orders.py" %*
 set "ERR=%ERRORLEVEL%"

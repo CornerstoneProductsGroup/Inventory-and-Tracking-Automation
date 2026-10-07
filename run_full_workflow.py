@@ -28,7 +28,7 @@ a WORKFLOW RUN SUMMARY lists skipped steps (e.g. empty Rithum queues) and all er
 Use --invoice-report-only to run only phase 0 (combine with --invoice-report-modes).
 Use --invoice-report-date YYYY-MM-DD (or MM/DD/YYYY) for a custom invoice report day (Depot, Lowe's, Tractor).
 Use --tracking-invoicing-only to skip inventories and run tracking lanes only.
-Use --pull-orders-only to run only the morning order pull (CommerceHub PDF/CSV, SPS, warehouse print).
+Use --pull-orders-only to run only the morning order pull (CommerceHub PDF/CSV, then SPS Tractor/Grainger).
 Use --fedex-batch-only to run only FedEx batch shipping (Lowe's CSV upload + labels).
 Use --worldship-import-only to run only UPS WorldShip batch import (CornerstoneMaster labels).
 Use --worldship-export-only to run only UPS WorldShip batch export (Depot Shipments tracking CSV).
@@ -717,9 +717,14 @@ def main() -> int:
         "--pull-orders-only",
         action="store_true",
         help=(
-            "Run only the morning pull-orders workflow (CommerceHub PDF/CSV, SPS Tractor/Grainger, "
-            "warehouse print). Not part of All Steps unless you add it there later."
+            "Run only the morning order pull in Order Pulls/ (CommerceHub PDF/CSV, then "
+            "SPS Tractor/Grainger). Not part of All Steps unless you add it there later."
         ),
+    )
+    parser.add_argument(
+        "--pull-orders-dry-run",
+        action="store_true",
+        help="With --pull-orders-only, list CommerceHub files and SPS orders without downloading.",
     )
     parser.add_argument(
         "--worldship-import-only",
@@ -841,6 +846,8 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+    if args.pull_orders_dry_run:
+        args.pull_orders_only = True
 
     if args.invoice_report_only and args.skip_invoice_report:
         parser.error("--invoice-report-only cannot be combined with --skip-invoice-report")
@@ -908,7 +915,7 @@ def main() -> int:
         parser.error("Use either --with-vendor-emails or --vendor-emails-only, not both.")
 
     tracking_invoicing_only = bool(args.tracking_invoicing_only)
-    pull_orders_only = bool(args.pull_orders_only)
+    pull_orders_only = bool(args.pull_orders_only) or bool(args.pull_orders_dry_run)
     worldship_import_only = bool(args.worldship_import_only)
     worldship_export_only = bool(args.worldship_export_only)
     ups_online_batch_only = bool(args.ups_online_batch_only)
@@ -994,13 +1001,18 @@ def main() -> int:
                 "Update/pull Inventory Submissions and retry."
             )
             return 1
+        dry = bool(args.pull_orders_dry_run)
         print(
             "\n"
             + "=" * 60
-            + "\nPull Orders — CommerceHub PDF/CSV, SPS Tractor/Grainger, warehouse print\n"
+            + "\nPull Orders — CommerceHub PDF/CSV, then SPS Tractor/Grainger"
+            + (" (DRY RUN)" if dry else "")
+            + "\n"
             + "=" * 60
         )
         pull_cmd = [python_exe, str(pull_script)]
+        if dry:
+            pull_cmd.append("--dry-run")
         if args.invoice_report_date:
             pull_cmd.extend(["--date", args.invoice_report_date.strip()])
         pull_errors = _run_single("Pull Orders", pull_cmd, INVENTORY_DIR)
