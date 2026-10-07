@@ -28,6 +28,16 @@ def _ensure_pywinauto() -> None:
 
 
 def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="UPS WorldShip batch import and label save.")
+    parser.add_argument(
+        "--stop-before-print",
+        action="store_true",
+        help="Save LabelPDF rows, then leave WorldShip open to print Label1 rows on its own.",
+    )
+    args = parser.parse_args()
+
     os.chdir(_HERE)
     if str(_HERE) not in sys.path:
         sys.path.insert(0, str(_HERE))
@@ -46,7 +56,7 @@ def main() -> int:
     from automation.worldship_batch_import import run_worldship_batch_import_start
 
     try:
-        result = run_worldship_batch_import_start()
+        result = run_worldship_batch_import_start(stop_before_print=args.stop_before_print)
     except Exception as exc:
         print(f"[worldship] ERROR: {exc}", flush=True)
         return 1

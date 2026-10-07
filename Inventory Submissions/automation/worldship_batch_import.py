@@ -1647,8 +1647,14 @@ def _save_one_label_step(
     return True, last_hwnd, failed
 
 
-def _run_label_work_plan(plan) -> tuple[int, int, list[dict[str, str]]]:
-    """Process SAVE and PRINT steps in CSV row order while WorldShip runs the batch."""
+def _run_label_work_plan(
+    plan, *, stop_before_print: bool = False
+) -> tuple[int, int, list[dict[str, str]]]:
+    """Process SAVE and PRINT steps in CSV row order while WorldShip runs the batch.
+
+    When stop_before_print is set, return as soon as the first warehouse-print
+    row is reached and do not click anything else in WorldShip.
+    """
     from automation.windows_save_as import (
         find_save_as_dialog_hwnd,
         reset_last_save_folder,
@@ -1685,6 +1691,13 @@ def _run_label_work_plan(plan) -> tuple[int, int, list[dict[str, str]]]:
 
     for step in steps:
         if step.action == "print":
+            if stop_before_print:
+                _log(
+                    f"Reached warehouse-print rows at row {step.order.row_number}, "
+                    f"PO {step.order.po!r}. Leaving WorldShip open so those rows "
+                    "print on their own."
+                )
+                return saved, printed, failed
             _log(
                 f"--- Print step {step.step_index}/{len(steps)}: row {step.order.row_number}, "
                 f"PO {step.order.po!r}, SKU {step.order.sku!r} ---"
@@ -1873,7 +1886,7 @@ def _run_save_label_phase(plan) -> tuple[int, list[dict[str, str]]]:
     return saved, failed
 
 
-def _save_shipping_labels(app, main) -> int:
+def _save_shipping_labels(app, main, *, stop_before_print: bool = False) -> int:
     from automation.warehouse_print_vendors import load_warehouse_print_vendors
     from automation.worldship_cornerstone_master import load_cornerstone_orders
     from automation.worldship_label_work_plan import (
@@ -1891,7 +1904,20 @@ def _save_shipping_labels(app, main) -> int:
     )
     log_worldship_label_work_plan(plan, vendor_maps)
 
-    saved, printed, failed_labels = _run_label_work_plan(plan)
+    saved, printed, failed_labels = _run_label_work_plan(
+        plan, stop_before_print=stop_before_print
+    )
+    if stop_before_print:
+        _log(
+            f"WorldShip handoff: {saved} label(s) saved. "
+            "This automation will stop clicking WorldShip and leave it running."
+        )
+        if failed_labels:
+            _log(
+                f"WARN: {len(failed_labels)} save(s) did not land on disk before the handoff."
+            )
+            _log_failed_label_summary(failed_labels)
+        return saved
     if failed_labels:
         _log(
             f"Continuing WorldShip batch with {len(failed_labels)} label(s) to re-print later."
@@ -1911,7 +1937,7 @@ def _save_shipping_labels(app, main) -> int:
     return saved
 
 
-def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
+def run_worldship_batch_import_start(*, stop_before_print: bool = False) -> WorldShipBatchImportResult:
     """
     WorldShip: Import-Export → Batch Import → auto-process → preview Next →
     Smart Pickup Yes → wait for processing → save each label from CornerstoneMaster.
@@ -1993,7 +2019,7 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
 
     _advance_after_preview_next(processing_timeout_s=proc_timeout)
 
-    labels_saved = _save_shipping_labels(app, main)
+    labels_saved = _save_shipping_labels(app, main, stop_before_print=stop_before_print)
     record_count = labels_saved
     import_source = None
     _log(f"Completed {labels_saved} label save(s).")

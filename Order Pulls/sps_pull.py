@@ -24,6 +24,7 @@ the SPS screen) so selectors can be fixed quickly if SPS changes its layout.
 import argparse
 import base64
 import datetime as dt
+import json
 import logging
 import os
 import re
@@ -51,6 +52,7 @@ DASHBOARD_URL = "https://commerce.spscommerce.com/fulfillment"
 BROWSER_PROFILE_DIR = Path.home() / ".sps_pull_browser"
 HERE = Path(__file__).resolve().parent
 LOG_FILE = HERE / "sps_pull.log"
+MANIFEST_FILE = HERE / "sps_pull_manifest.json"
 ENV_FILE = HERE.parent / "Inventory Submissions" / ".env"
 LOGIN_WAIT_MINUTES = 5
 PDF_WAIT_SECONDS = 90
@@ -569,7 +571,7 @@ def snapshot(f, name):
         pass
 
 
-def process_retailer(page, r, date_label, dry_run, net_pdfs, summary):
+def process_retailer(page, r, date_label, dry_run, net_pdfs, summary, manifest):
     log.info("--- %s ---", r["name"])
     f = open_new_orders(page)
     clear_selection(f)
@@ -580,7 +582,8 @@ def process_retailer(page, r, date_label, dry_run, net_pdfs, summary):
         summary.append(("NONE", r["name"], "", ""))
         return
     ids = [x[1] for x in rows]
-    log.info("%d new order(s): %s", len(ids), ", ".join(ids))
+    log.info("CHECK saw %s: %d order(s): %s", r["name"], len(ids), ", ".join(ids))
+    manifest["seen"].append({"name": r["name"], "orders": ids})
 
     pdf_dest = unique_path(Path(r["pdf"]) / f"{r['name']} {date_label}.pdf")
     csv_dest = unique_path(Path(r["csv"]) / f"{r['name']} {date_label}.csv")
@@ -597,13 +600,15 @@ def process_retailer(page, r, date_label, dry_run, net_pdfs, summary):
         raise RuntimeError(f"Expected {len(rows)} selected, SPS shows {n}")
 
     size = print_to_pdf(page, f, pdf_dest, net_pdfs)
-    log.info("Saved PDF (%d bytes) -> %s", size, pdf_dest)
+    log.info("CHECK saved %s PDF (%d bytes) -> %s", r["name"], size, pdf_dest)
     summary.append(("SAVED PDF", r["name"], ", ".join(ids), str(pdf_dest)))
+    manifest["saved"].append({"name": r["name"], "kind": "pdf", "path": str(pdf_dest)})
 
     page.wait_for_timeout(1500)
     title = download_csv(page, f, csv_dest, ids)
-    log.info("Saved CSV (%s) -> %s", title, csv_dest)
+    log.info("CHECK saved %s CSV (%s) -> %s", r["name"], title, csv_dest)
     summary.append(("SAVED CSV", r["name"], ", ".join(ids), str(csv_dest)))
+    manifest["saved"].append({"name": r["name"], "kind": "csv", "path": str(csv_dest)})
     clear_selection(f)  # uncheck before the next retailer
 
 
@@ -627,6 +632,7 @@ def main():
     log.info("SPS pull %s%s", date_label, " (DRY RUN)" if args.dry_run else "")
 
     summary, failed = [], False
+    manifest = {"date": date_label, "seen": [], "saved": [], "failed": []}
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             str(BROWSER_PROFILE_DIR), headless=args.headless, accept_downloads=True,
@@ -651,13 +657,20 @@ def main():
             ensure_logged_in(page)
             for r in RETAILERS:
                 try:
-                    process_retailer(page, r, date_label, args.dry_run, net_pdfs, summary)
+                    process_retailer(page, r, date_label, args.dry_run, net_pdfs, summary, manifest)
                 except Exception as e:
                     failed = True
                     log.error("FAILED %s: %s", r["name"], e)
                     summary.append(("FAILED", r["name"], "", str(e)))
+                    manifest["failed"].append({"name": r["name"], "error": str(e)})
         finally:
             ctx.close()
+
+    if not args.dry_run:
+        MANIFEST_FILE.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        log.info("Wrote %s", MANIFEST_FILE.name)
+    seen_names = [item["name"] for item in manifest["seen"]]
+    log.info("CHECK SPS retailers seen: %s", ", ".join(seen_names) if seen_names else "(none)")
 
     log.info("=== Summary ===")
     for s in summary:

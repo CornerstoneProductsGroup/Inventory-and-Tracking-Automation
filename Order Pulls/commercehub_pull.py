@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import datetime as dt
+import json
 import logging
 import os
 import shutil
@@ -68,6 +69,7 @@ RETAILERS = {
 # Separate from inventory/tracking and from the old pull-orders Edge profiles.
 BROWSER_PROFILE_DIR = Path.home() / ".commercehub_pull_browser"
 LOG_FILE = Path(__file__).with_name("commercehub_pull.log")
+MANIFEST_FILE = Path(__file__).with_name("commercehub_pull_manifest.json")
 ENV_FILE = Path(__file__).resolve().parent.parent / "Inventory Submissions" / ".env"
 INVENTORY_DIR = ENV_FILE.parent
 
@@ -223,7 +225,7 @@ def click_download(page, fileid):
         raise RuntimeError(f"No download started for file {fileid}")
 
 
-def process_page(page, label, url, kind, ext, date_label, dry_run, summary):
+def process_page(page, label, url, kind, ext, date_label, dry_run, summary, manifest):
     log.info("--- %s ---", label)
     page.goto(url)
     page.wait_for_selector("#fileDownloadTable", timeout=30_000)
@@ -241,6 +243,14 @@ def process_page(page, label, url, kind, ext, date_label, dry_run, summary):
             summary.append(("SKIPPED", label, r["partner"], r["file"], "unknown partner"))
             continue
 
+        log.info("CHECK saw %s %s: %s (%s)", cfg["name"], kind.upper(), r["file"], r["count"])
+        manifest["seen"].append({
+            "name": cfg["name"],
+            "kind": kind,
+            "partner": r["partner"],
+            "file": r["file"],
+            "count": r["count"],
+        })
         dest = unique_path(Path(cfg[kind]) / f"{cfg['name']} {date_label}{ext}")
         if dry_run:
             log.info("[dry run] %s | %s | %s -> %s", r["partner"], r["file"], r["count"], dest)
@@ -252,11 +262,21 @@ def process_page(page, label, url, kind, ext, date_label, dry_run, summary):
             dl = click_download(page, r["fileid"])
             tmp = Path(dl.path())
             shutil.copyfile(tmp, dest)
-            log.info("Saved %s | %s (%s) -> %s", r["partner"], r["file"], r["count"], dest)
+            log.info("CHECK saved %s %s -> %s", cfg["name"], kind.upper(), dest)
             summary.append(("SAVED", label, r["partner"], r["file"], str(dest)))
+            manifest["saved"].append({
+                "name": cfg["name"],
+                "kind": kind,
+                "path": str(dest),
+            })
         except Exception as e:  # keep going with the other retailers
             log.error("FAILED %s | %s: %s", r["partner"], r["file"], e)
             summary.append(("FAILED", label, r["partner"], r["file"], str(e)))
+            manifest["failed"].append({
+                "name": cfg["name"],
+                "kind": kind,
+                "error": str(e),
+            })
         # The table can change after a download; reload before the next row.
         page.goto(url)
         page.wait_for_selector("#fileDownloadTable", timeout=30_000)
@@ -285,6 +305,7 @@ def main():
     log.info("CommerceHub pull %s%s", date_label, " (DRY RUN)" if args.dry_run else "")
 
     summary = []
+    manifest = {"date": date_label, "seen": [], "saved": [], "failed": []}
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             str(BROWSER_PROFILE_DIR), headless=args.headless, accept_downloads=True)
@@ -292,9 +313,15 @@ def main():
         try:
             ensure_logged_in(page)
             for label, url, kind, ext in PAGES:
-                process_page(page, label, url, kind, ext, date_label, args.dry_run, summary)
+                process_page(page, label, url, kind, ext, date_label, args.dry_run, summary, manifest)
         finally:
             ctx.close()
+
+    if not args.dry_run:
+        MANIFEST_FILE.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        log.info("Wrote %s", MANIFEST_FILE.name)
+    seen_names = sorted({item["name"] for item in manifest["seen"]})
+    log.info("CHECK CommerceHub files seen: %s", ", ".join(seen_names) if seen_names else "(none)")
 
     log.info("=== Summary ===")
     for s in summary:

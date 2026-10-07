@@ -13,6 +13,7 @@ venv/
 # Order Pulls (menu 0) — logs and SPS debug snapshots. Browser profiles stay in the user home folder.
 Order Pulls/*.log
 Order Pulls/sps_debug_*.html
+Order Pulls/*_manifest.json
 
 # Bundled invoice report app — same repo as the rest: commit source + requirements.txt on main;
 # do not commit secrets, venv, or browser session dirs (other PCs: pull once, then local .venv + .env).

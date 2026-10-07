@@ -18,7 +18,6 @@ echo   F  FedEx Batch ^(Lowe's CSV upload, finalize, labels^)
 echo   W  WorldShip / UPS shipping
 echo   O  Vendor Emails ^(Outlook — ALL or pick one vendor^)
 echo   0  Pull Orders ^(submenu^)
-echo   S  Scheduled morning chain ^(see SCHEDULED_WORKFLOW.md^)
 echo   1  All Steps ^(vendor emails, invoice reports, inventories, tracking/invoicing, FedEx pickups^)
 echo   2  All Steps WITHOUT vendor emails ^(same as 1, use when emails were already sent^)
 echo   T  Tracking / Invoicing ^(submenu^)
@@ -26,15 +25,16 @@ echo   I  Inventory ^(submenu^)
 echo   R  Invoice Reports ^(submenu^)
 echo   9  Custom Invoice Report Date ^(pick retailer, then enter date^)
 echo   P  FedEx Pickups ^(schedule next-day Ground pickups — Warehouse / Post Protector^)
+echo   M  Ship today ^(pull orders, WorldShip saves, then FedEx batch^)
 echo.
 echo Invoice reports need commercehub_invoice_export.py in "invoice report" folder.
 echo.
-choice /C FWO01TIR9SP2 /N /M "Press F, W, O, 0, 1, 2, T, I, R, 9, S, or P: "
-REM choice sets ERRORLEVEL to key index: F=1 W=2 O=3 0=4 1=5 T=6 I=7 R=8 9=9 S=10 P=11 2=12
+choice /C FWO01TIR9P2M /N /M "Press F, W, O, 0, 1, 2, T, I, R, 9, P, or M: "
+REM choice sets ERRORLEVEL to key index: F=1 W=2 O=3 0=4 1=5 T=6 I=7 R=8 9=9 P=10 2=11 M=12
 REM "if errorlevel N" means ERRORLEVEL >= N — test highest index first.
-if errorlevel 12 goto OPT_2
-if errorlevel 11 goto SUBMENU_PICKUP
-if errorlevel 10 goto OPT_S
+if errorlevel 12 goto OPT_M
+if errorlevel 11 goto OPT_2
+if errorlevel 10 goto SUBMENU_PICKUP
 if errorlevel 9 goto OPT_9
 if errorlevel 8 goto SUBMENU_INVOICE
 if errorlevel 7 goto SUBMENU_INVENTORY
@@ -45,6 +45,17 @@ if errorlevel 3 goto OPT_O
 if errorlevel 2 goto OPT_W
 if errorlevel 1 goto OPT_F
 goto MAIN_MENU
+
+:OPT_M
+echo.
+echo Ship today — pull orders, wait for output CSVs, WorldShip saves, FedEx batch
+echo WorldShip is left open when warehouse-print rows start.
+echo.
+pushd "%~dp0Inventory Submissions"
+"%RUNNER%" "run_ship_today.py"
+set "ERR=!ERRORLEVEL!"
+popd
+goto DONE
 
 :OPT_F
 set "EXTRA_ARGS=--fedex-batch-only"
@@ -154,9 +165,6 @@ goto RUN
 :PULL_DRY
 set "EXTRA_ARGS=--pull-orders-only --pull-orders-dry-run"
 goto RUN
-
-:OPT_S
-goto RUN_SCHEDULED
 
 :OPT_1
 set "EXTRA_ARGS=--with-vendor-emails --invoice-report-modes all --run-grainger-all --with-fedex-pickup"
@@ -430,16 +438,6 @@ if defined EXTRA_ARGS echo Options: %EXTRA_ARGS%
 echo.
 
 "%RUNNER%" "run_full_workflow.py" %EXTRA_ARGS% %*
-set "ERR=%ERRORLEVEL%"
-goto DONE
-
-:RUN_SCHEDULED
-echo.
-echo Running scheduled workflow chain...
-if /I not "%RUNNER%"=="python" echo Using: %RUNNER%
-echo.
-
-"%RUNNER%" "run_scheduled_workflow.py" %*
 set "ERR=%ERRORLEVEL%"
 goto DONE
 
