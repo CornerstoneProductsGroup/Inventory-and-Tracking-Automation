@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -67,7 +68,8 @@ CAPTURE_JS = r"""
 (() => {
   if (window.__spsCapture) return; window.__spsCapture = true;
   window.__pdfs = []; window.__printCalls = 0;
-  window.print = function () { window.__printCalls++; };
+  // Leave window.print alone. SPS opens Chrome's print preview; we pick
+  // Save as PDF there and use the Windows Save As dialog.
   const keep = (blob) => {
     try {
       blob.slice(0, 5).text().then(h => {
@@ -400,11 +402,196 @@ def collect_pdfs(page):
     return found
 
 
+_PRINT_SKIP_BUTTONS = {"save", "cancel", "print", "more settings", "see more..."}
+
+
+def _uia_name(ctrl) -> str:
+    try:
+        return (ctrl.window_text() or "").strip()
+    except Exception:
+        return ""
+
+
+def _click_uia(ctrl) -> None:
+    try:
+        ctrl.click_input()
+    except Exception:
+        ctrl.click()
+
+
+def _chrome_print_windows():
+    from pywinauto import Desktop
+
+    desktop = Desktop(backend="uia")
+    found = []
+    for win in desktop.windows():
+        try:
+            cls = win.element_info.class_name or ""
+            title = win.window_text() or ""
+        except Exception:
+            continue
+        if "Chrome" in cls or "SPS" in title or "Print" in title:
+            found.append(win)
+    return found
+
+
+def _preview_buttons(win):
+    try:
+        return list(win.descendants(control_type="Button"))
+    except Exception:
+        return []
+
+
+def _find_print_preview():
+    """Chrome print preview: Cancel plus Save (Save as PDF) or Print (a real printer)."""
+    for win in _chrome_print_windows():
+        buttons = _preview_buttons(win)
+        names = {_uia_name(b).lower() for b in buttons}
+        if "cancel" in names and ("save" in names or "print" in names):
+            return win, buttons
+    return None, []
+
+
+def _list_items(win):
+    items = []
+    for kind in ("ListItem", "MenuItem"):
+        try:
+            items.extend(win.descendants(control_type=kind))
+        except Exception:
+            pass
+    return items
+
+
+def _click_save_as_pdf_item(win) -> bool:
+    pools = [win]
+    try:
+        from pywinauto import Desktop
+
+        pools.extend(Desktop(backend="uia").windows())
+    except Exception:
+        pass
+    seen = set()
+    for pool in pools:
+        key = id(pool)
+        if key in seen:
+            continue
+        seen.add(key)
+        for item in _list_items(pool):
+            if _uia_name(item) == "Save as PDF":
+                log.info("CHECK print destination: Save as PDF")
+                _click_uia(item)
+                time.sleep(0.4)
+                return True
+    return False
+
+
+def _destination_button(buttons):
+    for btn in buttons:
+        name = _uia_name(btn)
+        low = name.lower()
+        if not name or low in _PRINT_SKIP_BUTTONS:
+            continue
+        if (
+            name == "Save as PDF"
+            or "dpi" in low
+            or "printer" in low
+            or low.startswith("zebra")
+            or low.startswith("toshiba")
+            or low.startswith("brother")
+        ):
+            return btn
+    return None
+
+
+def _choose_save_as_pdf(win, buttons) -> None:
+    if _click_save_as_pdf_item(win):
+        return
+    dest = _destination_button(buttons)
+    if dest is None:
+        raise RuntimeError("Print destination dropdown not found")
+    if _uia_name(dest) == "Save as PDF":
+        log.info("CHECK print destination already Save as PDF")
+        return
+    log.info("CHECK opening print destinations (currently %s)", _uia_name(dest))
+    _click_uia(dest)
+    time.sleep(0.5)
+    if not _click_save_as_pdf_item(win):
+        raise RuntimeError("Save as PDF was not in the print destination list")
+
+
+def _click_preview_save(win) -> None:
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        for btn in _preview_buttons(win):
+            if _uia_name(btn) != "Save":
+                continue
+            try:
+                enabled = btn.is_enabled()
+            except Exception:
+                enabled = True
+            if not enabled:
+                continue
+            log.info("CHECK clicking Save on the print window")
+            _click_uia(btn)
+            return
+        time.sleep(0.3)
+    raise RuntimeError("Save button on the print window did not become ready")
+
+
+def _save_via_print_preview(dest: Path) -> bool:
+    """Destination = Save as PDF, click Save, then Windows Save As into dest."""
+    inv = Path(__file__).resolve().parent.parent / "Inventory Submissions"
+    if str(inv) not in sys.path:
+        sys.path.insert(0, str(inv))
+    from automation.windows_save_as import fill_save_as_dialog
+
+    deadline = time.monotonic() + 25
+    win = None
+    buttons = []
+    while time.monotonic() < deadline:
+        win, buttons = _find_print_preview()
+        if win is not None:
+            break
+        time.sleep(0.4)
+    if win is None:
+        return False
+    _choose_save_as_pdf(win, buttons)
+    win, buttons = _find_print_preview()
+    if win is None:
+        raise RuntimeError("Print window closed before Save could be clicked")
+    _click_preview_save(win)
+    log.info("CHECK Save As dialog — folder %s, file %s", dest.parent, dest.name)
+    if not fill_save_as_dialog(dest, timeout_s=60):
+        raise RuntimeError(f"Save As did not write {dest}")
+    _dismiss_print_preview()
+    log.info("CHECK back on the order page; leaving the same orders checked")
+    return True
+
+
+def _dismiss_print_preview() -> None:
+    """Close a leftover print preview so the order list is visible. Do not change checks."""
+    win, buttons = _find_print_preview()
+    if win is None:
+        return
+    for btn in buttons:
+        if _uia_name(btn) == "Cancel":
+            log.info("CHECK closing the print window")
+            _click_uia(btn)
+            time.sleep(0.5)
+            return
+
+
 def print_to_pdf(page, f, dest: Path, net_pdfs):
     collect_pdfs(page)      # discard anything left over
     net_pdfs.clear()
     click_more(f)
     f.get_by_text(re.compile(r"^\s*Print\s*$")).first.click()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if _save_via_print_preview(dest):
+            return dest.stat().st_size
+    except Exception as exc:
+        log.error("Print preview save failed: %s", exc)
     for _ in range(PDF_WAIT_SECONDS * 2):
         page.wait_for_timeout(500)
         pdfs = collect_pdfs(page)
@@ -416,7 +603,6 @@ def print_to_pdf(page, f, dest: Path, net_pdfs):
             break
     else:
         raise RuntimeError("Print clicked but no PDF was captured")
-    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
     return len(data)
 
@@ -509,28 +695,16 @@ def save_from_cloud(page, row, dest: Path):
         pass
 
 
-def reselect(f, ids):
-    """Orders normally stay checked after Print; re-check by ID if not."""
-    if selected_count(f) == len(ids):
-        return
-    clear_selection(f)
-    for tr, doc_id, _ in order_rows(f):
-        if doc_id in ids:
-            tick(tr)
-    if selected_count(f) not in (-1, len(ids)):
-        raise RuntimeError("Could not re-select the orders for the CSV")
-
-
 def download_csv(page, f, dest: Path, ids):
     n_orders = len(ids)
-    # Remember what's already in SPS's download list (Print adds one too).
+    # The orders are still checked after the PDF save. Do not clear or re-check them.
+    log.info("CHECK CSV download using the %d order(s) already checked", n_orders)
     try:
         open_download_menu(f)
         before = {t for t, _ in download_entries(f)}
         close_download_menu(f)
     except RuntimeError:
         before = set()
-    reselect(f, ids)
 
     click_cloud(f)
     f.get_by_text("Combine documents into one CSV file").first.click()
