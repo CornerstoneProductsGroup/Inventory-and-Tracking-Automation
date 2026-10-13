@@ -3,6 +3,9 @@
 CommerceHub Home Depot, Depot Special Order, and Lowe's must be saved and have
 an Order Splitter output CSV. Depot, Depot Special Order, and Tractor Supply
 must also be in the WorldShip CornerstoneMaster file before either ship step.
+
+The CommerceHub Canada pull runs after the US pull. If Canada fails, it is
+logged as a warning and WorldShip / FedEx still run for the US and SPS orders.
 """
 from __future__ import annotations
 
@@ -162,14 +165,27 @@ def main() -> int:
 
     py = sys.executable
     pull_code = 0
-    for script in ("commercehub_pull.py", "sps_pull.py"):
+    canada_failed = False
+    # (title, script, extra args, required). Canada is not required: a failure
+    # there is reported but does not stop WorldShip / FedEx.
+    pulls = (
+        ("commercehub_pull.py", "commercehub_pull.py", [], True),
+        ("commercehub_pull.py --account canada", "commercehub_pull.py", ["--account", "canada"], False),
+        ("sps_pull.py", "sps_pull.py", [], True),
+    )
+    for title, script, extra, required in pulls:
         path = _ORDER_PULLS / script
         if not path.is_file():
             _log(f"Missing {path}")
             return 1
-        code = _run(script, [py, str(path)], _ORDER_PULLS)
+        code = _run(title, [py, str(path), *extra], _ORDER_PULLS)
         if code != 0:
-            pull_code = code
+            if required:
+                pull_code = code
+            else:
+                canada_failed = True
+                _log(f"WARNING: CommerceHub Canada pull failed (exit {code}). "
+                     "Check Order Pulls/commercehub_canada_pull.log. Continuing with US and SPS.")
     if pull_code != 0:
         _log("Order pull did not finish cleanly. WorldShip and FedEx will not start.")
         return pull_code
@@ -232,6 +248,8 @@ def main() -> int:
     else:
         _log("Lowe's was not on CommerceHub. Skipping FedEx.")
 
+    if canada_failed:
+        _log("REMINDER: the CommerceHub Canada pull failed earlier. Pull Canada again (menu 0).")
     _log("Ship today finished.")
     return 0
 
