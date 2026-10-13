@@ -99,6 +99,7 @@ ACCOUNTS = {
         "env_pass": "RITHUM_PASSWORD",
         "profile": "Cornerstone Products Group - (1)",
         "retailers": US_RETAILERS,
+        "kinds": ("pdf", "csv"),
         # Separate from inventory/tracking and from the old pull-orders Edge profiles.
         "browser_dir": Path.home() / ".commercehub_pull_browser",
         "log": HERE / "commercehub_pull.log",
@@ -110,6 +111,7 @@ ACCOUNTS = {
         "env_pass": "RITHUM_CA_PASSWORD",
         "profile": None,                            # VERIFY on first Canada run
         "retailers": CANADA_RETAILERS,
+        "kinds": ("pdf",),                          # Canada has packing slips only
         "browser_dir": Path.home() / ".commercehub_pull_browser_canada",
         "log": HERE / "commercehub_canada_pull.log",
         "manifest": HERE / "commercehub_canada_pull_manifest.json",
@@ -311,11 +313,23 @@ def click_download(page, fileid):
         raise RuntimeError(f"No download started for file {fileid}")
 
 
+def open_table(page, url, label) -> bool:
+    """Load a download page. False (logged) if its file table never shows up."""
+    page.goto(url)
+    try:
+        page.wait_for_selector("#fileDownloadTable", timeout=30_000)
+    except PWTimeout:
+        log.warning("No file table on the %s page (%s); treating it as no files waiting.",
+                    label, page.url)
+        return False
+    show_all_rows(page)
+    return True
+
+
 def process_page(page, label, url, kind, ext, date_label, dry_run, summary, manifest):
     log.info("--- %s ---", label)
-    page.goto(url)
-    page.wait_for_selector("#fileDownloadTable", timeout=30_000)
-    show_all_rows(page)
+    if not open_table(page, url, label):
+        return
     rows = read_rows(page)
     if not rows:
         log.info("No files waiting.")
@@ -370,9 +384,8 @@ def process_page(page, label, url, kind, ext, date_label, dry_run, summary, mani
                 "error": str(e),
             })
         # The table can change after a download; reload before the next row.
-        page.goto(url)
-        page.wait_for_selector("#fileDownloadTable", timeout=30_000)
-        show_all_rows(page)
+        if not open_table(page, url, label):
+            break
 
 
 def main():
@@ -424,6 +437,9 @@ def main():
         try:
             ensure_logged_in(page)
             for label, url, kind, ext in PAGES:
+                if kind not in ACCOUNT["kinds"]:
+                    log.info("--- %s --- skipped (%s has no %s files)", label, ACCOUNT["label"], kind.upper())
+                    continue
                 process_page(page, label, url, kind, ext, date_label, args.dry_run, summary, manifest)
         finally:
             ctx.close()
