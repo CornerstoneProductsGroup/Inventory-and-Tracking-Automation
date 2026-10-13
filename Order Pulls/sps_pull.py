@@ -585,7 +585,14 @@ def print_to_pdf(page, f, dest: Path, net_pdfs):
     collect_pdfs(page)      # discard anything left over
     net_pdfs.clear()
     click_more(f)
-    f.get_by_text(re.compile(r"^\s*Print\s*$")).first.click()
+    item = f.get_by_text(re.compile(r"^\s*Print\s*$")).first
+    item.wait_for(state="visible", timeout=15_000)
+    # SPS calls window.print(), which opens Chrome's print window and freezes
+    # the page until it closes. A normal Playwright click waits for the page and
+    # would hang here forever, so fire the click from a timer and move on to
+    # the print window right away.
+    item.evaluate("el => setTimeout(() => el.click(), 50)")
+    log.info("CHECK clicked Print; waiting for the print window")
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         if _save_via_print_preview(dest):
