@@ -1,4 +1,4 @@
-"""CLI: morning order pull (CommerceHub PDF/CSV, then SPS Tractor/Grainger).
+"""CLI: morning order pull (CommerceHub US + Canada PDF/CSV, then SPS Tractor/Grainger).
 
 Menu 0. Runs the scripts in the repo's Order Pulls folder. Those scripts keep
 their own browser profiles and sign in with Inventory Submissions/.env.
@@ -26,12 +26,12 @@ def _parse_date(raw: str):
     raise ValueError(f"Invalid date {raw!r}; use YYYY-MM-DD or MM/DD/YYYY.")
 
 
-def _run_script(name: str, extra: list[str]) -> int:
+def _run_script(name: str, extra: list[str], title: str | None = None) -> int:
     script = _ORDER_PULLS / name
     if not script.is_file():
         print(f"ERROR: Missing {script}")
         return 1
-    print(f"\n=== {name} ===", flush=True)
+    print(f"\n=== {title or name} ===", flush=True)
     completed = subprocess.run([sys.executable, str(script), *extra], cwd=str(_ORDER_PULLS))
     return int(completed.returncode or 0)
 
@@ -39,8 +39,8 @@ def _run_script(name: str, extra: list[str]) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Pull morning orders: CommerceHub packing slips + CSVs, "
-            "then SPS Tractor Supply and Grainger PDF + CSV."
+            "Pull morning orders: CommerceHub packing slips + CSVs (US login, "
+            "then Canada login), then SPS Tractor Supply and Grainger PDF + CSV."
         )
     )
     parser.add_argument(
@@ -49,7 +49,10 @@ def main() -> int:
         default=None,
         help="Order date for file names (default: today). Formats: YYYY-MM-DD or MM/DD/YYYY.",
     )
-    parser.add_argument("--skip-commercehub", action="store_true")
+    parser.add_argument("--skip-commercehub", action="store_true",
+                        help="Skip both CommerceHub logins (US and Canada)")
+    parser.add_argument("--skip-canada", action="store_true",
+                        help="Skip only the CommerceHub Canada login")
     parser.add_argument("--skip-sps", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="List files and orders; click nothing")
     args = parser.parse_args()
@@ -69,7 +72,10 @@ def main() -> int:
 
     codes: list[int] = []
     if not args.skip_commercehub:
-        codes.append(_run_script("commercehub_pull.py", extra))
+        codes.append(_run_script("commercehub_pull.py", extra, "CommerceHub (US)"))
+        if not args.skip_canada:
+            codes.append(_run_script("commercehub_pull.py", [*extra, "--account", "canada"],
+                                     "CommerceHub Canada"))
     if not args.skip_sps:
         codes.append(_run_script("sps_pull.py", extra))
     if not codes:

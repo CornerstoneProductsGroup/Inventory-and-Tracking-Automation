@@ -6,13 +6,21 @@ Packing Slips page (PDF) and the Order Files page (.neworders -> .csv):
 clicks Download and saves the file as "<Retailer> <M-D-YYYY>.<ext>" in that
 retailer's folder.
 
-This is menu 0. It uses its own browser profile (not the inventory or
-tracking browsers) and signs in with RITHUM_USERNAME / RITHUM_PASSWORD from
-Inventory Submissions/.env.
+This is menu 0. Each CommerceHub login ("account") has its own browser
+profile (not the inventory or tracking browsers), its own .env credentials
+from Inventory Submissions/.env, its own retailer list, log and manifest:
+
+    us      RITHUM_USERNAME / RITHUM_PASSWORD        (Depot, Lowe's, ...)
+    canada  RITHUM_CA_USERNAME / RITHUM_CA_PASSWORD  (Canada retailers)
 
 Usage:
-    python commercehub_pull.py --dry-run   # list what it WOULD download, clicks nothing
-    python commercehub_pull.py             # real run (pulls the orders in CommerceHub)
+    python commercehub_pull.py --dry-run                    # US: list what it WOULD download
+    python commercehub_pull.py                              # US: real run
+    python commercehub_pull.py --account canada --dry-run   # Canada: list only
+    python commercehub_pull.py --account canada             # Canada: real run
+
+Partners that are not in an account's RETAILERS list are never downloaded;
+the log shows them as "SKIP unknown partner '<name>'" so you can add them.
 """
 
 import argparse
@@ -30,15 +38,13 @@ from playwright.sync_api import sync_playwright
 # ----------------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------------
-PROFILE_NAME = "Cornerstone Products Group - (1)"
-
 BASE = Path(r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction")
 CSV_BASE = BASE / "6-CSV Order Files"
 
 # Key = partner name exactly as shown in the PARTNER column on CommerceHub.
 # "name" = what goes in the file name. Check the three marked VERIFY the
 # first time they show up on the site.
-RETAILERS = {
+US_RETAILERS = {
     "The Home Depot Inc": {
         "name": "Depot",
         "pdf": BASE / "1-Depot",
@@ -66,10 +72,53 @@ RETAILERS = {
     },
 }
 
-# Separate from inventory/tracking and from the old pull-orders Edge profiles.
-BROWSER_PROFILE_DIR = Path.home() / ".commercehub_pull_browser"
-LOG_FILE = Path(__file__).with_name("commercehub_pull.log")
-MANIFEST_FILE = Path(__file__).with_name("commercehub_pull_manifest.json")
+# Canada login. Same layout as US_RETAILERS. Left empty on purpose: until a
+# partner is added here, a Canada run only lists what it sees (nothing is
+# downloaded). Run "--account canada --dry-run" and copy the exact partner
+# names from the log's "SKIP unknown partner" lines. Example:
+#
+#   "The Home Depot Canada": {
+#       "name": "Depot Canada",
+#       "pdf": BASE / "<Canada PDF folder>",
+#       "csv": CSV_BASE / "<Canada CSV folder>",
+#   },
+CANADA_RETAILERS = {
+}
+
+HERE = Path(__file__).resolve().parent
+
+# One entry per CommerceHub login. Browser profiles are separate so both
+# logins stay signed in and never mix sessions.
+#   profile: OrderStream profile to pick on the "Select OrderStream Profile"
+#            screen. None = pick it automatically if there is only one, else
+#            log the choices and wait for you to pick in the browser.
+ACCOUNTS = {
+    "us": {
+        "label": "CommerceHub",
+        "env_user": "RITHUM_USERNAME",
+        "env_pass": "RITHUM_PASSWORD",
+        "profile": "Cornerstone Products Group - (1)",
+        "retailers": US_RETAILERS,
+        # Separate from inventory/tracking and from the old pull-orders Edge profiles.
+        "browser_dir": Path.home() / ".commercehub_pull_browser",
+        "log": HERE / "commercehub_pull.log",
+        "manifest": HERE / "commercehub_pull_manifest.json",
+    },
+    "canada": {
+        "label": "CommerceHub Canada",
+        "env_user": "RITHUM_CA_USERNAME",
+        "env_pass": "RITHUM_CA_PASSWORD",
+        "profile": None,                            # VERIFY on first Canada run
+        "retailers": CANADA_RETAILERS,
+        "browser_dir": Path.home() / ".commercehub_pull_browser_canada",
+        "log": HERE / "commercehub_canada_pull.log",
+        "manifest": HERE / "commercehub_canada_pull_manifest.json",
+    },
+}
+
+# Set from --account in main().
+ACCOUNT = ACCOUNTS["us"]
+RETAILERS = US_RETAILERS
 ENV_FILE = Path(__file__).resolve().parent.parent / "Inventory Submissions" / ".env"
 INVENTORY_DIR = ENV_FILE.parent
 
@@ -84,6 +133,7 @@ DOWNLOAD_TIMEOUT_MS = 60_000
 # ----------------------------------------------------------------------------
 
 log = logging.getLogger("chub")
+ACCOUNT_KEY = "us"
 
 
 def today_label(d=None):
@@ -121,27 +171,33 @@ def match_retailer(partner: str):
     return None, None
 
 
-def _env_credentials() -> tuple[str, str]:
+def _load_env():
     try:
         from dotenv import load_dotenv
 
         load_dotenv(ENV_FILE, override=False)
     except Exception as exc:
         log.warning("Could not load %s (%s)", ENV_FILE, exc)
-    return (os.getenv("RITHUM_USERNAME") or "").strip(), (os.getenv("RITHUM_PASSWORD") or "").strip()
+
+
+def _env_credentials() -> tuple[str, str]:
+    _load_env()
+    return ((os.getenv(ACCOUNT["env_user"]) or "").strip(),
+            (os.getenv(ACCOUNT["env_pass"]) or "").strip())
 
 
 def sign_in_with_env(page) -> bool:
     """Type the Inventory Submissions/.env CommerceHub login. Returns False if it is missing."""
     username, password = _env_credentials()
     if not username or not password:
-        log.warning("Missing RITHUM_USERNAME or RITHUM_PASSWORD in %s", ENV_FILE)
+        log.warning("Missing %s or %s in %s", ACCOUNT["env_user"], ACCOUNT["env_pass"], ENV_FILE)
         return False
     if str(INVENTORY_DIR) not in sys.path:
         sys.path.insert(0, str(INVENTORY_DIR))
     from automation.commercehub_login import perform_commercehub_login
 
-    log.info("Signing in to CommerceHub with RITHUM_USERNAME from Inventory Submissions/.env")
+    log.info("Signing in to %s with %s from Inventory Submissions/.env",
+             ACCOUNT["label"], ACCOUNT["env_user"])
     perform_commercehub_login(
         page, username, password, log=lambda message: log.info("%s", message)
     )
@@ -157,9 +213,10 @@ def ensure_logged_in(page):
     while dt.datetime.now() < deadline:
         url = page.url
         if "switch-account" in url or "switch-identity" in url:
-            log.info("Selecting profile: %s", PROFILE_NAME)
-            page.get_by_role("link", name=PROFILE_NAME, exact=True).click()
-            page.wait_for_url("**/dsm/**", timeout=60_000)
+            if select_profile(page):
+                page.wait_for_url("**/dsm/**", timeout=60_000)
+                continue
+            page.wait_for_timeout(2000)  # waiting for a manual pick
             continue
         if "dsm.commercehub.com/dsm" in url and "login" not in url.lower():
             return
@@ -179,6 +236,35 @@ def ensure_logged_in(page):
             asked = True
         page.wait_for_timeout(2000)
     raise RuntimeError("Timed out waiting for CommerceHub sign-in / profile selection.")
+
+
+_profile_choices_logged = False
+
+
+def select_profile(page) -> bool:
+    """Click this account's OrderStream profile. Returns False while waiting for a manual pick."""
+    global _profile_choices_logged
+    wanted = ACCOUNT["profile"]
+    if wanted:
+        log.info("Selecting profile: %s", wanted)
+        page.get_by_role("link", name=wanted, exact=True).click()
+        return True
+    links = page.locator("a").filter(has_text="(")
+    try:
+        links.first.wait_for(timeout=15_000)
+    except PWTimeout:
+        pass
+    names = [t.strip() for t in links.all_inner_texts() if t.strip()]
+    if len(names) == 1:
+        log.info("Selecting the only profile: %s", names[0])
+        links.first.click()
+        return True
+    if not _profile_choices_logged:
+        log.warning("Several OrderStream profiles for %s: %s. Pick one in the browser, then set "
+                    "ACCOUNTS['%s']['profile'] in commercehub_pull.py to skip this next time.",
+                    ACCOUNT["label"], " | ".join(names) or "(none found)", ACCOUNT_KEY)
+        _profile_choices_logged = True
+    return False
 
 
 def show_all_rows(page):
@@ -288,27 +374,46 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="list files, click nothing")
     ap.add_argument("--headless", action="store_true", help="no browser window (only once signed in)")
     ap.add_argument("--date", default=None, help="file-name date (YYYY-MM-DD or MM/DD/YYYY); default today")
+    ap.add_argument("--account", choices=sorted(ACCOUNTS), default="us",
+                    help="which CommerceHub login to pull (default: us)")
     args = ap.parse_args()
+
+    global ACCOUNT, ACCOUNT_KEY, RETAILERS
+    ACCOUNT_KEY = args.account
+    ACCOUNT = ACCOUNTS[args.account]
+    RETAILERS = ACCOUNT["retailers"]
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.StreamHandler(sys.stdout),
-                  logging.FileHandler(LOG_FILE, encoding="utf-8")],
+                  logging.FileHandler(ACCOUNT["log"], encoding="utf-8")],
     )
+
+    # A login that is not set up yet is skipped, not failed, so menu 0 keeps
+    # working for the other accounts.
+    if args.account != "us":
+        _load_env()
+        if not (os.getenv(ACCOUNT["env_user"]) or "").strip():
+            log.warning("SKIPPED %s: %s is not set in %s", ACCOUNT["label"],
+                        ACCOUNT["env_user"], ENV_FILE)
+            return
+        if not RETAILERS:
+            log.warning("%s has no retailers configured yet: nothing will be downloaded; "
+                        "partners found are listed as SKIP lines below.", ACCOUNT["label"])
     try:
         order_date = parse_order_date(args.date) if args.date else None
     except ValueError as exc:
         log.error("%s", exc)
         sys.exit(1)
     date_label = today_label(order_date)
-    log.info("CommerceHub pull %s%s", date_label, " (DRY RUN)" if args.dry_run else "")
+    log.info("%s pull %s%s", ACCOUNT["label"], date_label, " (DRY RUN)" if args.dry_run else "")
 
     summary = []
-    manifest = {"date": date_label, "seen": [], "saved": [], "failed": []}
+    manifest = {"account": args.account, "date": date_label, "seen": [], "saved": [], "failed": []}
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
-            str(BROWSER_PROFILE_DIR), headless=args.headless, accept_downloads=True)
+            str(ACCOUNT["browser_dir"]), headless=args.headless, accept_downloads=True)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
             ensure_logged_in(page)
@@ -318,10 +423,11 @@ def main():
             ctx.close()
 
     if not args.dry_run:
-        MANIFEST_FILE.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        log.info("Wrote %s", MANIFEST_FILE.name)
+        ACCOUNT["manifest"].write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        log.info("Wrote %s", ACCOUNT["manifest"].name)
     seen_names = sorted({item["name"] for item in manifest["seen"]})
-    log.info("CHECK CommerceHub files seen: %s", ", ".join(seen_names) if seen_names else "(none)")
+    log.info("CHECK %s files seen: %s", ACCOUNT["label"],
+             ", ".join(seen_names) if seen_names else "(none)")
 
     log.info("=== Summary ===")
     for s in summary:
