@@ -72,17 +72,17 @@ US_RETAILERS = {
     },
 }
 
-# Canada login. Same layout as US_RETAILERS. Left empty on purpose: until a
-# partner is added here, a Canada run only lists what it sees (nothing is
-# downloaded). Run "--account canada --dry-run" and copy the exact partner
-# names from the log's "SKIP unknown partner" lines. Example:
-#
-#   "The Home Depot Canada": {
-#       "name": "Depot Canada",
-#       "pdf": BASE / "<Canada PDF folder>",
-#       "csv": CSV_BASE / "<Canada CSV folder>",
-#   },
+# Canada login. Same layout as US_RETAILERS. A partner with no "csv" folder
+# is PDF-only: if a CSV row ever shows up for it, it is logged and left in
+# CommerceHub (not downloaded). Canada is Home Depot only, Post Protector
+# orders for now.
+CANADA_BASE = Path(r"\\svr01\Cornerstone\Dot Com Packing Slips\15-Home Depot Canada")
 CANADA_RETAILERS = {
+    "The Home Depot Canada": {
+        "name": "Canada",                           # -> "Canada 10-11-2026.pdf"
+        "pdf": CANADA_BASE / "Post Protector",
+        "csv": None,                                # packing slips only, no CSV
+    },
 }
 
 HERE = Path(__file__).resolve().parent
@@ -327,6 +327,12 @@ def process_page(page, label, url, kind, ext, date_label, dry_run, summary, mani
             log.warning("SKIP unknown partner '%s' (%s, %s) - add it to RETAILERS",
                         r["partner"], r["file"], r["count"])
             summary.append(("SKIPPED", label, r["partner"], r["file"], "unknown partner"))
+            continue
+
+        if not cfg.get(kind):
+            log.warning("SKIP %s %s (%s, %s): no %s folder set for this partner; left in CommerceHub",
+                        r["partner"], kind.upper(), r["file"], r["count"], kind.upper())
+            summary.append(("SKIPPED", label, r["partner"], r["file"], f"no {kind.upper()} folder"))
             continue
 
         log.info("CHECK saw %s %s: %s (%s)", cfg["name"], kind.upper(), r["file"], r["count"])
