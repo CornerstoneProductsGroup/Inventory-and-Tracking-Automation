@@ -156,19 +156,45 @@ def _resolve_fedex_user_data_dir(browser_cfg: dict[str, Any]) -> Path | None:
     return path
 
 
+_FEDEX_AUTOMATION_DOWNLOADS = Path(__file__).resolve().parent.parent / "fedex_browser_downloads"
+
+
+def _fedex_automation_download_dir() -> Path:
+    _FEDEX_AUTOMATION_DOWNLOADS.mkdir(parents=True, exist_ok=True)
+    return _FEDEX_AUTOMATION_DOWNLOADS
+
+
 def _fedex_launch_args(browser_cfg: dict[str, Any]) -> list[str]:
     extra = browser_cfg.get("args") or []
     if isinstance(extra, str):
         extra = [extra]
+    # One --disable-features flag only: a second flag replaces the first.
+    # Leave Edge's download bubble on. A manual FedEx login uses that box, and
+    # turning it off does not create the shipment-report file.
+    features = {
+        "BlockThirdPartyCookies",
+        "TrackingProtection3pcd",
+    }
+    passthrough: list[str] = []
+    for arg in extra:
+        text = str(arg).strip()
+        if not text:
+            continue
+        if text.startswith("--disable-features="):
+            for part in text.split("=", 1)[1].split(","):
+                part = part.strip()
+                if part:
+                    features.add(part)
+            continue
+        passthrough.append(text)
     base = [
         "--disable-blink-features=AutomationControlled",
-        "--disable-features=BlockThirdPartyCookies,TrackingProtection3pcd",
+        "--disable-features=" + ",".join(sorted(features)),
     ]
     out: list[str] = []
-    for arg in [*base, *extra]:
-        text = str(arg).strip()
-        if text and text not in out:
-            out.append(text)
+    for arg in [*base, *passthrough]:
+        if arg not in out:
+            out.append(arg)
     return out
 
 
@@ -230,6 +256,7 @@ def _open_fedex_browser(
                 context = p.chromium.launch_persistent_context(
                     str(user_data_dir),
                     accept_downloads=True,
+                    downloads_path=str(_fedex_automation_download_dir()),
                     **launch_kwargs,
                 )
                 _apply_fedex_stealth(context)
@@ -244,6 +271,7 @@ def _open_fedex_browser(
             storage = STORAGE_STATE if STORAGE_STATE.is_file() else None
             context = browser.new_context(
                 accept_downloads=True,
+                downloads_path=str(_fedex_automation_download_dir()),
                 storage_state=str(storage) if storage else None,
                 locale="en-US",
                 viewport={"width": 1440, "height": 900},
@@ -3557,14 +3585,179 @@ def _click_shipment_report_choice(item) -> str:
     return label
 
 
-def _browser_download_dirs() -> list[Path]:
-    """Folders Edge/Chrome may use when the report bypasses Playwright's download event."""
+_REPORT_CAPTURE_JS = """
+() => {
+  if (window.__fedexReportHooked) return;
+  window.__fedexReportHooked = true;
+  window.__fedexReportB64 = null;
+  window.__fedexReportSize = 0;
+  const toB64 = (bytes) => {
+    let binary = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  };
+  const stash = (buf) => {
+    try {
+      const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+      if (bytes.length < 100 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) return;
+      if (bytes.length <= (window.__fedexReportSize || 0)) return;
+      window.__fedexReportB64 = toB64(bytes);
+      window.__fedexReportSize = bytes.length;
+    } catch (e) {}
+  };
+  const origFetch = window.fetch;
+  if (typeof origFetch === "function") {
+    window.fetch = function (...args) {
+      return origFetch.apply(this, args).then((res) => {
+        try {
+          res.clone().arrayBuffer().then(stash).catch(() => {});
+        } catch (e) {}
+        return res;
+      });
+    };
+  }
+  const origSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function (...args) {
+    this.addEventListener("load", function () {
+      try {
+        if (this.response instanceof ArrayBuffer) stash(this.response);
+        else if (this.response instanceof Blob) {
+          this.response.arrayBuffer().then(stash).catch(() => {});
+        }
+      } catch (e) {}
+    });
+    return origSend.apply(this, args);
+  };
+}
+"""
+
+
+def _install_shipment_report_capture(page: Page) -> None:
+    """Keep spreadsheet bytes the page already received, even if Edge's download box stays blank."""
+    for target in [page, *page.frames]:
+        try:
+            target.evaluate(_REPORT_CAPTURE_JS)
+        except Exception:
+            continue
+
+
+def _reset_shipment_report_capture(page: Page) -> None:
+    for target in [page, *page.frames]:
+        try:
+            target.evaluate(
+                "() => { window.__fedexReportB64 = null; window.__fedexReportSize = 0; }"
+            )
+        except Exception:
+            continue
+
+
+def _read_captured_report_bytes(page: Page) -> bytes | None:
+    for target in [page, *page.frames]:
+        try:
+            raw = target.evaluate("() => window.__fedexReportB64 || null")
+        except Exception:
+            continue
+        if not raw:
+            continue
+        try:
+            data = base64.b64decode(raw)
+        except Exception:
+            continue
+        if _bytes_are_xlsx(data):
+            return data
+    return None
+
+
+def _bytes_are_xlsx(data: bytes) -> bool:
+    return len(data) >= 100 and data[:2] == b"PK"
+
+
+def _response_may_be_report(response) -> bool:
+    try:
+        if response.status >= 400:
+            return False
+        headers = {str(k).lower(): str(v).lower() for k, v in response.headers.items()}
+    except Exception:
+        return False
+    ctype = headers.get("content-type", "")
+    disp = headers.get("content-disposition", "")
+    url = ""
+    try:
+        url = (response.url or "").lower()
+    except Exception:
+        url = ""
+    if "spreadsheet" in ctype or "ms-excel" in ctype or "excel" in ctype:
+        return True
+    if ".xlsx" in disp or ".xls" in disp:
+        return True
+    if "attachment" in disp and ("report" in disp or "sheet" in disp or "excel" in disp):
+        return True
+    if "octet-stream" in ctype and any(
+        token in url or token in disp for token in ("report", "export", "download", "xlsx", "xls")
+    ):
+        return True
+    return False
+
+
+def _user_downloads_dir() -> Path:
+    """The folder a person gets when they download the report themselves."""
+    home = Path.home()
+    for folder in (
+        home / "Downloads",
+        Path(os.environ.get("USERPROFILE") or "") / "Downloads",
+        home / "OneDrive" / "Downloads",
+    ):
+        try:
+            if folder.is_dir():
+                return folder
+        except OSError:
+            continue
+    return _fedex_automation_download_dir()
+
+
+def _allow_normal_edge_download(page: Page, folder: Path) -> None:
+    """Save the report like a manual Edge download, not a hidden automation file.
+
+    Playwright's default capture leaves Edge's top-right download box blank and
+    never writes the xlsx. A normal login downloads into the user's Downloads folder.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "behavior": "allow",
+        "downloadPath": str(folder),
+    }
+    session = page.context.new_cdp_session(page)
+    try:
+        session.send("Page.setDownloadBehavior", payload)
+    except Exception as page_exc:
+        try:
+            session.send("Browser.setDownloadBehavior", {**payload, "eventsEnabled": True})
+        except Exception as browser_exc:
+            _log(
+                "WARN: Edge stayed on the automation download capture "
+                f"({page_exc}; {browser_exc})."
+            )
+            return
+    _log(f"Shipment report will download like a manual Edge save → {folder}")
+
+
+def _browser_download_dirs(cfg: dict[str, Any] | None = None) -> list[Path]:
+    """Folders that can receive the report when Edge's download popup stays blank."""
     home = Path.home()
     candidates = [
+        _user_downloads_dir(),
+        _fedex_automation_download_dir(),
         home / "Downloads",
         home / "OneDrive" / "Downloads",
         Path(os.environ.get("USERPROFILE") or "") / "Downloads",
     ]
+    if cfg:
+        profile = _resolve_fedex_user_data_dir(cfg.get("browser") or {})
+        if profile is not None:
+            candidates.append(profile / "Default" / "Downloads")
     found: list[Path] = []
     seen: set[str] = set()
     for folder in candidates:
@@ -3581,16 +3774,18 @@ def _browser_download_dirs() -> list[Path]:
     return found
 
 
-def _newest_xlsx_since(folders: list[Path], started: float) -> Path | None:
+def _newest_report_file_since(folders: list[Path], started: float) -> Path | None:
+    """Newest spreadsheet written after the click, including extension-less download files."""
     newest: Path | None = None
     newest_mtime = started - 2.0
     for folder in folders:
         try:
-            paths = list(folder.glob("*.xlsx"))
+            paths = [path for path in folder.iterdir() if path.is_file()]
         except OSError:
             continue
         for path in paths:
-            if path.name.startswith("~$"):
+            name = path.name.lower()
+            if name.startswith("~$") or name.endswith((".crdownload", ".tmp", ".partial")):
                 continue
             try:
                 stat = path.stat()
@@ -3598,9 +3793,24 @@ def _newest_xlsx_since(folders: list[Path], started: float) -> Path | None:
                 continue
             if stat.st_size < 100 or stat.st_mtime < newest_mtime:
                 continue
+            if not name.endswith((".xlsx", ".xls")):
+                try:
+                    with path.open("rb") as handle:
+                        magic = handle.read(2)
+                except OSError:
+                    continue
+                if magic != b"PK":
+                    continue
             newest = path
             newest_mtime = stat.st_mtime
     return newest
+
+
+def _write_report_copy(data: bytes, dest_name: str) -> Path:
+    folder = Path(tempfile.mkdtemp(prefix="fedex_report_"))
+    path = folder / dest_name
+    path.write_bytes(data)
+    return path
 
 
 def _commit_shipment_report_file(src: Path, dest: Path) -> None:
@@ -3648,21 +3858,39 @@ def _download_shipment_report_xlsx(page: Page, cfg: dict[str, Any], dest: Path) 
     page.wait_for_timeout(1000)
 
     captured: list[Any] = []
+    report_responses: list[Any] = []
 
     def _on_download(download) -> None:
         captured.append(download)
 
+    def _on_response(response) -> None:
+        try:
+            if _response_may_be_report(response):
+                report_responses.append(response)
+        except Exception:
+            return
+
     page.context.on("download", _on_download)
-    download_dirs = _browser_download_dirs()
-    per_try_s = min(60.0, max(20.0, timeout_ms / 1000.0 / 2))
+    page.context.on("response", _on_response)
+    _install_shipment_report_capture(page)
+    download_dirs = _browser_download_dirs(cfg)
+    manual_download_dir = _user_downloads_dir()
+    _allow_normal_edge_download(page, manual_download_dir)
+    # One long wait matches a manual download. Extra clicks were cancelling the file
+    # and leaving the run looking stuck.
+    per_try_s = max(45.0, timeout_ms / 1000.0)
     local_copy: Path | None = None
     reloaded_for_empty_menu = False
+    tried_responses: set[int] = set()
     try:
-        for attempt in range(1, 4):
+        for attempt in range(1, 3):
             if attempt > 1:
                 _close_download_menu(page, cfg)
             started = time.time()
             captured.clear()
+            report_responses.clear()
+            tried_responses.clear()
+            _reset_shipment_report_capture(page)
             try:
                 _open_download_menu(page, cfg)
             except DownloadMenuEmpty as exc:
@@ -3677,6 +3905,7 @@ def _download_shipment_report_xlsx(page: Page, cfg: dict[str, Any], dest: Path) 
                     )
                 page.wait_for_timeout(1000)
                 reloaded_for_empty_menu = True
+                _install_shipment_report_capture(page)
                 continue
             except FedexBatchError as exc:
                 _log(f"WARN: shipment report menu attempt {attempt}: {exc}")
@@ -3694,53 +3923,95 @@ def _download_shipment_report_xlsx(page: Page, cfg: dict[str, Any], dest: Path) 
             except Exception as exc:
                 _log(f"WARN: could not click Shipment report (attempt {attempt}): {exc}")
                 continue
-            _log(f"Clicked {label!r} (attempt {attempt}); waiting for the xlsx…")
-            deadline = time.monotonic() + per_try_s
-            dropped: Path | None = None
+            _log(
+                f"Clicked {label!r} (attempt {attempt}). "
+                "Waiting for the same download a manual FedEx login gets."
+            )
+            deadline = time.monotonic() + (per_try_s if attempt == 1 else 45.0)
+            next_progress = time.monotonic() + 15.0
             while time.monotonic() < deadline:
-                if captured:
+                if time.monotonic() >= next_progress:
+                    remaining = int(deadline - time.monotonic())
+                    _log(f"Still waiting for the shipment report file ({remaining}s left)…")
+                    next_progress = time.monotonic() + 15.0
+                page_bytes = _read_captured_report_bytes(page)
+                if page_bytes is not None:
+                    local_copy = _write_report_copy(page_bytes, dest.name)
+                    _log(
+                        "Shipment report taken from the page response "
+                        f"({local_copy.stat().st_size:,} bytes), not from Edge's download box."
+                    )
                     break
-                dropped = _newest_xlsx_since(download_dirs, started)
+                for response in list(report_responses):
+                    key = id(response)
+                    if key in tried_responses:
+                        continue
+                    tried_responses.add(key)
+                    try:
+                        data = response.body()
+                    except Exception as exc:
+                        _log(f"WARN: report response was not readable ({response.url}): {exc}")
+                        continue
+                    if not _bytes_are_xlsx(data):
+                        continue
+                    local_copy = _write_report_copy(data, dest.name)
+                    _log(
+                        "Shipment report taken from the network response "
+                        f"({local_copy.stat().st_size:,} bytes)."
+                    )
+                    break
+                if local_copy is not None:
+                    break
+                if captured:
+                    local_copy = Path(tempfile.mkdtemp(prefix="fedex_report_")) / dest.name
+                    captured[-1].save_as(str(local_copy))
+                    _log(
+                        "Shipment report captured from the browser download "
+                        f"({local_copy.stat().st_size:,} bytes)."
+                    )
+                    break
+                dropped = _newest_report_file_since(download_dirs, started)
                 if dropped is not None:
+                    last_size = -1
+                    stable = False
+                    for _ in range(10):
+                        try:
+                            size = dropped.stat().st_size
+                        except OSError:
+                            size = 0
+                        if size >= 100 and size == last_size:
+                            stable = True
+                            break
+                        last_size = size
+                        page.wait_for_timeout(300)
+                    if not stable:
+                        continue
+                    local_copy = Path(tempfile.mkdtemp(prefix="fedex_report_")) / dest.name
+                    shutil.copy2(dropped, local_copy)
+                    _log(
+                        f"Shipment report file found ({dropped.name}, "
+                        f"{local_copy.stat().st_size:,} bytes) in {dropped.parent}."
+                    )
                     break
                 page.wait_for_timeout(400)
-            if captured:
-                local_copy = Path(tempfile.mkdtemp(prefix="fedex_report_")) / dest.name
-                captured[-1].save_as(str(local_copy))
-                _log(f"Shipment report captured from the browser ({local_copy.stat().st_size:,} bytes).")
+            if local_copy is not None:
                 break
-            if dropped is not None:
-                last_size = -1
-                stable = False
-                for _ in range(10):
-                    try:
-                        size = dropped.stat().st_size
-                    except OSError:
-                        size = 0
-                    if size >= 100 and size == last_size:
-                        stable = True
-                        break
-                    last_size = size
-                    page.wait_for_timeout(300)
-                if not stable:
-                    continue
-                local_copy = Path(tempfile.mkdtemp(prefix="fedex_report_")) / dest.name
-                shutil.copy2(dropped, local_copy)
+            if attempt == 1:
                 _log(
-                    f"Shipment report found in Downloads ({dropped.name}, "
-                    f"{local_copy.stat().st_size:,} bytes)."
+                    "WARN: Shipment report was clicked, but no file arrived "
+                    "(Edge's download box stayed empty). Retrying once."
                 )
-                break
-            _log("WARN: Shipment report was clicked but no xlsx arrived. Retrying.")
     finally:
-        try:
-            page.context.remove_listener("download", _on_download)
-        except Exception:
-            pass
+        for event, handler in (("download", _on_download), ("response", _on_response)):
+            try:
+                page.context.remove_listener(event, handler)
+            except Exception:
+                pass
 
     if local_copy is None:
         raise FedexBatchError(
-            'Could not download "Shipment report (.xlsx file)" from the DOWNLOAD menu.'
+            "Shipment report was clicked, but no spreadsheet was saved. "
+            "Edge's download box opened blank and the page did not return a file."
         )
     try:
         _commit_shipment_report_file(local_copy, dest)
