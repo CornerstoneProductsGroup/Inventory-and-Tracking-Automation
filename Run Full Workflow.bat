@@ -25,7 +25,7 @@ echo   I  Inventory ^(submenu^)
 echo   R  Invoice Reports ^(submenu^)
 echo   9  Custom Invoice Report Date ^(pick retailer, then enter date^)
 echo   P  FedEx Pickups ^(schedule next-day Ground pickups — Warehouse / Post Protector^)
-echo   M  Ship today ^(pull orders, WorldShip saves, then FedEx batch^)
+echo   M  Ship today ^(CommerceHub US + Canada pull, then FedEx batch^)
 echo.
 echo Invoice reports need commercehub_invoice_export.py in "invoice report" folder.
 echo.
@@ -48,8 +48,7 @@ goto MAIN_MENU
 
 :OPT_M
 echo.
-echo Ship today — pull orders, wait for output CSVs, WorldShip saves, FedEx batch
-echo WorldShip is left open when warehouse-print rows start.
+echo Ship today — CommerceHub US + Canada pull, wait for Lowe's output CSV, FedEx batch
 echo.
 pushd "%~dp0Inventory Submissions"
 "%RUNNER%" "run_ship_today.py"
