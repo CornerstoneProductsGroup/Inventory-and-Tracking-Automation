@@ -1,11 +1,9 @@
 """Ship today: pull CommerceHub orders, confirm the files that were seen, then FedEx.
 
-CommerceHub Home Depot, Depot Special Order, and Lowe's must be saved for
-everything that was seen. FedEx batch runs when Lowe's was seen, after its
-Order Splitter output CSV exists.
-
-The CommerceHub Canada pull runs after the US pull. If Canada fails, it is
-logged as a warning and FedEx still runs for the US orders.
+FedEx batch runs as long as Lowe's checks out: Lowe's was seen on CommerceHub,
+every Lowe's file that was seen was saved, and its Order Splitter output CSV
+exists. Problems with Depot, Depot Special Order, or the CommerceHub Canada
+pull are reported as warnings and do not stop FedEx.
 """
 from __future__ import annotations
 
@@ -98,35 +96,31 @@ def main() -> int:
         sys.path.insert(0, str(_HERE))
 
     py = sys.executable
-    pull_code = 0
-    canada_failed = False
-    # (title, script, extra args, required). Canada is not required: a failure
-    # there is reported but does not stop FedEx.
+    warnings: list[str] = []
+    started = time.time()
+    # (title, script, extra args). A non-zero exit is only a warning here; whether
+    # Lowe's checks out is decided from the pull record below.
     pulls = (
-        ("commercehub_pull.py", "commercehub_pull.py", [], True),
-        ("commercehub_pull.py --account canada", "commercehub_pull.py", ["--account", "canada"], False),
+        ("CommerceHub US pull", "commercehub_pull.py", []),
+        ("CommerceHub Canada pull", "commercehub_pull.py", ["--account", "canada"]),
     )
-    for title, script, extra, required in pulls:
+    for title, script, extra in pulls:
         path = _ORDER_PULLS / script
         if not path.is_file():
             _log(f"Missing {path}")
             return 1
         code = _run(title, [py, str(path), *extra], _ORDER_PULLS)
         if code != 0:
-            if required:
-                pull_code = code
-            else:
-                canada_failed = True
-                _log(f"WARNING: CommerceHub Canada pull failed (exit {code}). "
-                     "Check Order Pulls/commercehub_canada_pull.log. Continuing with US.")
-    if pull_code != 0:
-        _log("Order pull did not finish cleanly. FedEx will not start.")
-        return pull_code
+            warnings.append(f"{title} did not finish cleanly (exit {code}). Check its log in Order Pulls.")
 
     try:
         commercehub = _load_manifest(_CH_MANIFEST)
+        if _CH_MANIFEST.stat().st_mtime < started:
+            raise FileNotFoundError(f"{_CH_MANIFEST.name} was not written by this run")
     except (FileNotFoundError, json.JSONDecodeError) as exc:
-        _log(f"Cannot confirm what was seen: {exc}")
+        _log(f"Cannot confirm what CommerceHub US saw: {exc}")
+        _log("Lowe's cannot be checked. FedEx will not start.")
+        _print_warnings(warnings)
         return 1
 
     ch_seen = sorted({item.get("name") for item in commercehub.get("seen") or [] if item.get("name")})
@@ -135,28 +129,40 @@ def main() -> int:
         + (", ".join(ch_seen) if ch_seen else "(no Home Depot, Depot Special Order, or Lowe's files)")
     )
 
-    ch_names, problems = _confirm_saved(commercehub, _CH_NAMES)
-    if problems:
-        _log("Downloaded files do not match what was seen:")
-        for problem in problems:
+    other_names = tuple(name for name in _CH_NAMES if name != "Lowe's")
+    _other_seen, other_problems = _confirm_saved(commercehub, other_names)
+    warnings.extend(other_problems)
+    lowes_seen, lowes_problems = _confirm_saved(commercehub, ("Lowe's",))
+
+    code = 0
+    if lowes_problems:
+        _log("Lowe's does not check out:")
+        for problem in lowes_problems:
             _log(f"  {problem}")
         _log("FedEx will not start.")
-        return 1
-
-    if "Lowe's" in ch_names:
-        if _wait_for_lowes_output() != 0:
-            _log("FedEx will not start.")
-            return 1
-        code = _run("FedEx batch", [py, str(_HERE / "run_fedex_batch.py")], _HERE)
-        if code != 0:
-            return code
-    else:
+        code = 1
+    elif not lowes_seen:
         _log("Lowe's was not on CommerceHub. Skipping FedEx.")
+    elif _wait_for_lowes_output() != 0:
+        _log("FedEx will not start.")
+        code = 1
+    else:
+        _log("Lowe's checks out.")
+        code = _run("FedEx batch", [py, str(_HERE / "run_fedex_batch.py")], _HERE)
 
-    if canada_failed:
-        _log("REMINDER: the CommerceHub Canada pull failed earlier. Pull Canada again (menu 0).")
-    _log("Ship today finished.")
-    return 0
+    _print_warnings(warnings)
+    if code == 0:
+        _log("Ship today finished.")
+    return code
+
+
+def _print_warnings(warnings: list[str]) -> None:
+    if not warnings:
+        return
+    _log("WARNINGS:")
+    for warning in warnings:
+        _log(f"  WARNING: {warning}")
+    _log("Re-pull anything missing from menu 0.")
 
 
 if __name__ == "__main__":
