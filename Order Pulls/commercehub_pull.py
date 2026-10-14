@@ -18,6 +18,7 @@ Usage:
     python commercehub_pull.py                              # US: real run
     python commercehub_pull.py --account canada --dry-run   # Canada: list only
     python commercehub_pull.py --account canada             # Canada: real run
+    python commercehub_pull.py --only Depot "Depot Special Order" "Lowe's"
 
 Partners that are not in an account's RETAILERS list are never downloaded;
 the log shows them as "SKIP unknown partner '<name>'" so you can add them.
@@ -395,12 +396,27 @@ def main():
     ap.add_argument("--date", default=None, help="file-name date (YYYY-MM-DD or MM/DD/YYYY); default today")
     ap.add_argument("--account", choices=sorted(ACCOUNTS), default="us",
                     help="which CommerceHub login to pull (default: us)")
+    ap.add_argument("--only", nargs="+", default=None, metavar="NAME",
+                    help="download only these file names (for example Depot \"Lowe's\"); "
+                         "other partners are left in CommerceHub")
     args = ap.parse_args()
 
     global ACCOUNT, ACCOUNT_KEY, RETAILERS
     ACCOUNT_KEY = args.account
     ACCOUNT = ACCOUNTS[args.account]
     RETAILERS = ACCOUNT["retailers"]
+    if args.only:
+        wanted = {name.strip().casefold() for name in args.only if name.strip()}
+        RETAILERS = {
+            key: cfg for key, cfg in RETAILERS.items()
+            if str(cfg.get("name") or "").strip().casefold() in wanted
+        }
+        found = {str(cfg.get("name") or "").strip().casefold() for cfg in RETAILERS.values()}
+        missing = sorted(wanted - found)
+        if missing:
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+            log.error("Unknown --only name(s) for %s: %s", args.account, ", ".join(missing))
+            sys.exit(2)
 
     logging.basicConfig(
         level=logging.INFO,
