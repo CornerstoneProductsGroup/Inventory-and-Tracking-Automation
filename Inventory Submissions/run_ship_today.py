@@ -56,14 +56,19 @@ def _load_manifest(path: Path) -> dict | None:
     return data
 
 
-def _saved_path(manifest: dict, name: str, kind: str) -> str | None:
+def _saved_paths(manifest: dict, name: str, kind: str) -> list[str]:
+    paths: list[str] = []
     for item in manifest.get("saved") or []:
         if item.get("name") == name and item.get("kind") == kind:
             path = Path(item.get("path") or "")
             if path.is_file():
-                return str(path)
-            return None
-    return None
+                paths.append(str(path))
+    return paths
+
+
+def _saved_path(manifest: dict, name: str, kind: str) -> str | None:
+    paths = _saved_paths(manifest, name, kind)
+    return paths[0] if paths else None
 
 
 def _was_seen(manifest: dict, name: str, kind: str | None = None) -> bool:
@@ -88,13 +93,21 @@ def _report_us(manifest: dict) -> None:
             _log(f"CHECK {name}: not on US CommerceHub.")
             continue
         for kind in _US_KINDS:
-            path = _saved_path(manifest, name, kind)
-            if path:
-                _log(f"CHECK saved {name} {kind.upper()} -> {path}")
-            elif _was_seen(manifest, name, kind):
-                _log(f"WARNING: {name} {kind.upper()} was seen but was not saved.")
-            else:
+            if not _was_seen(manifest, name, kind):
                 _log(f"CHECK {name} {kind.upper()}: not on US CommerceHub.")
+                continue
+            paths = _saved_paths(manifest, name, kind)
+            seen_count = sum(
+                1
+                for item in manifest.get("seen") or []
+                if item.get("name") == name and item.get("kind") == kind
+            )
+            for path in paths:
+                _log(f"CHECK saved {name} {kind.upper()} -> {path}")
+            if len(paths) < seen_count:
+                _log(
+                    f"WARNING: {name} {kind.upper()} saved {len(paths)} of {seen_count} file(s)."
+                )
 
 
 def _lowes_saved(manifest: dict) -> bool | None:

@@ -154,6 +154,31 @@ def parse_order_date(raw: str) -> dt.date:
     raise ValueError(f"Invalid date {raw!r}; use YYYY-MM-DD or MM/DD/YYYY.")
 
 
+def download_dest(cfg, kind: str, ext: str, date_label: str, page_number: int | None) -> Path:
+    """Packing-slip name. Extra Depot PDFs are "Depot <date> Page 1.pdf", then Page 2, ..."""
+    if page_number:
+        filename = f"{cfg['name']} {date_label} Page {page_number}{ext}"
+    else:
+        filename = f"{cfg['name']} {date_label}{ext}"
+    return unique_path(Path(cfg[kind]) / filename)
+
+
+def depot_pdf_page_numbers(rows) -> dict[int, int]:
+    """Number Depot packing slips when CommerceHub splits them after 100 pages.
+
+    One Depot PDF keeps the plain "Depot <date>.pdf" name. Two or more, in the
+    order shown on the packing-slip tab, become Page 1, Page 2, and so on.
+    """
+    indexes = []
+    for i, row in enumerate(rows):
+        _key, cfg = match_retailer(row["partner"])
+        if cfg and cfg.get("name") == "Depot" and cfg.get("pdf"):
+            indexes.append(i)
+    if len(indexes) < 2:
+        return {}
+    return {row_index: page for page, row_index in enumerate(indexes, start=1)}
+
+
 def unique_path(path: Path) -> Path:
     """Never overwrite: add (2), (3)... if the name is taken."""
     if not path.exists():
@@ -336,7 +361,16 @@ def process_page(page, label, url, kind, ext, date_label, dry_run, summary, mani
         log.info("No files waiting.")
         return
 
-    for r in rows:
+    pdf_pages = depot_pdf_page_numbers(rows) if kind == "pdf" else {}
+    if pdf_pages:
+        log.info(
+            "Depot has %d packing-slip files (CommerceHub caps a file at 100 pages). "
+            "Saving them as Page 1 through Page %d, in the order shown.",
+            len(pdf_pages),
+            len(pdf_pages),
+        )
+
+    for i, r in enumerate(rows):
         key, cfg = match_retailer(r["partner"])
         if not cfg:
             log.warning("SKIP unknown partner '%s' (%s, %s) - add it to RETAILERS",
@@ -358,7 +392,7 @@ def process_page(page, label, url, kind, ext, date_label, dry_run, summary, mani
             "file": r["file"],
             "count": r["count"],
         })
-        dest = unique_path(Path(cfg[kind]) / f"{cfg['name']} {date_label}{ext}")
+        dest = download_dest(cfg, kind, ext, date_label, pdf_pages.get(i))
         if dry_run:
             log.info("[dry run] %s | %s | %s -> %s", r["partner"], r["file"], r["count"], dest)
             summary.append(("DRY RUN", label, r["partner"], r["file"], str(dest)))
