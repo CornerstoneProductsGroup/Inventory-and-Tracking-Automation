@@ -3086,6 +3086,68 @@ async def _click_notifications_list_and_first_download_cloud(
     await _sps_click_through_wall_for_locator(page, click_loc)
 
 
+async def _combine_csv_modal_visible(page: Page) -> bool:
+    combine_re = re.compile(r"Combine\s+documents\s+into\s+one\s+CSV", re.I)
+    for ctx in _contexts(page):
+        hint = ctx.get_by_text(combine_re).first
+        try:
+            if await hint.count() and await hint.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _click_cloud_and_capture_direct_download(
+    page: Page, *, timeout_s: float
+) -> Download | None:
+    """
+    Click the selected-results cloud. One invoice starts a browser download and
+    never opens the combine dialog. Several invoices open that dialog instead,
+    so return as soon as the dialog is visible and leave the download for the
+    notifications-list step.
+    """
+    loop = asyncio.get_running_loop()
+    captured: asyncio.Future = loop.create_future()
+
+    def _on_download(download: Download) -> None:
+        if not captured.done():
+            captured.set_result(download)
+
+    page.on("download", _on_download)
+    try:
+        await _click_sps_bulk_download_cloud(page)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if captured.done():
+                return captured.result()
+            if await _combine_csv_modal_visible(page):
+                return None
+            await asyncio.sleep(0.2)
+        if captured.done():
+            return captured.result()
+        return None
+    finally:
+        try:
+            page.remove_listener("download", _on_download)
+        except Exception:
+            pass
+
+
+async def _save_tractor_playwright_download(
+    dl: Download,
+    *,
+    download_dir: Path,
+    report_day: date,
+    log,
+) -> Path:
+    dest = download_dir / f"_sps_tractor_raw_{report_day.isoformat()}.csv"
+    await dl.save_as(str(dest))
+    await asyncio.sleep(2.5)
+    await _wait_tractor_download_file_ready(dest, log=log)
+    return dest
+
+
 async def _wait_tractor_download_file_ready(
     path: Path, *, log, max_wait_s: float = 45.0, stable_reads: int = 4, poll_s: float = 0.25
 ) -> None:
@@ -3126,28 +3188,59 @@ async def _download_tractor_bulk_csv(
     await _sps_disable_pointer_blocking_backdrops(page, log)
     await _sps_wait_loading_veils_gone(page, timeout_ms=3_000)
     download_dir.mkdir(parents=True, exist_ok=True)
-    await _click_sps_bulk_download_cloud(page)
-    await _maybe_confirm_combine_csv_modal(page, log)
-    if log:
-        log(
-            "SPS: waiting for the combined export in the internal downloads list "
-            f"({expected_count} transaction(s))…"
-        )
-    await page.wait_for_timeout(1_000)
-    async with page.expect_download(timeout=download_timeout_ms) as di:
-        await _click_notifications_list_and_first_download_cloud(
-            page,
-            log,
-            expected_count=expected_count,
-        )
-    dl: Download = await di.value
 
-    dest = download_dir / f"_sps_tractor_raw_{report_day.isoformat()}.csv"
-    await dl.save_as(str(dest))
-    # Notifications-path downloads can still be flushing; give the OS time before teardown.
-    await asyncio.sleep(2.5)
-    await _wait_tractor_download_file_ready(dest, log=log)
-    return dest
+    async def _save_from_notifications_list() -> Path:
+        if log:
+            log(
+                "SPS: waiting for the export in the internal downloads list "
+                f"({expected_count} transaction(s))…"
+            )
+        await page.wait_for_timeout(1_000)
+        async with page.expect_download(timeout=download_timeout_ms) as di:
+            await _click_notifications_list_and_first_download_cloud(
+                page,
+                log,
+                expected_count=expected_count,
+            )
+        return await _save_tractor_playwright_download(
+            await di.value,
+            download_dir=download_dir,
+            report_day=report_day,
+            log=log,
+        )
+
+    # One selected invoice never opens "Combine documents into one CSV".
+    # The cloud click itself starts the browser download.
+    if expected_count == 1:
+        if log:
+            log(
+                "SPS: one invoice — the cloud click downloads the CSV directly "
+                "(no combine dialog)."
+            )
+        direct = await _click_cloud_and_capture_direct_download(page, timeout_s=20.0)
+        if direct is not None:
+            if log:
+                log("SPS: single-invoice CSV downloaded from the cloud click.")
+            return await _save_tractor_playwright_download(
+                direct,
+                download_dir=download_dir,
+                report_day=report_day,
+                log=log,
+            )
+        if not await _combine_csv_modal_visible(page):
+            if log:
+                log(
+                    "SPS: no combine dialog for the single invoice. "
+                    "Opening the downloads list for that file."
+                )
+            return await _save_from_notifications_list()
+        if log:
+            log("SPS: combine dialog appeared for the single invoice; using it.")
+    else:
+        await _click_sps_bulk_download_cloud(page)
+
+    await _maybe_confirm_combine_csv_modal(page, log)
+    return await _save_from_notifications_list()
 
 
 async def _click_select_all_transactions(page: Page, log=None) -> None:
@@ -3229,7 +3322,8 @@ async def run_tractor_sps_search_and_download_csv(
 ) -> Path | None:
     """
     Advanced Search must already be open. Applies previous-business-day range + Invoice, runs search,
-    selects all when results > 0, downloads combined CSV (modal when needed), saves to download_dir.
+    selects all when results > 0, then saves the CSV. One invoice downloads from the cloud click.
+    Several invoices use the combine-CSV dialog, then the downloads list.
     Returns path to the saved temp CSV, or None when Matching Results is 0.
     """
     step_timeout = min(180_000, max(45_000, nav_timeout_ms))
