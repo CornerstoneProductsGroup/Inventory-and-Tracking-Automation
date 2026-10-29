@@ -1,7 +1,6 @@
 """
-SPS Commerce (Tractor Supply path): login, fulfillment transactions, Advanced Search,
-Tractor Supply + outbound invoice + report-day filters, verified bulk CSV download,
-and save to the Tractor Supply share.
+SPS Commerce invoice path: login, fulfillment transactions, Advanced Search,
+Tractor Supply then Grainger (same date and Document Type Invoice), bulk CSV download.
 
 Credentials and SPS_URL match the Inventory Feed project
 (`Depot and Lowe's Automation with Inventory Feed / Inventory Submissions`):
@@ -1679,6 +1678,8 @@ async def _verify_tractor_invoice_results(
     report_day: date,
     timeout_ms: int,
     log=None,
+    partner_text: str = "tractor supply dropship",
+    partner_label: str = "Tractor Supply Dropship",
 ) -> None:
     """
     Advisory check before Select All / bulk download.
@@ -1690,7 +1691,7 @@ async def _verify_tractor_invoice_results(
     """
     if result_count == 0:
         return
-    partner = "tractor supply dropship"
+    partner = partner_text.strip().lower()
     date_tokens = _sps_report_day_tokens(report_day)
     deadline = time.monotonic() + timeout_ms / 1000.0
     last_rows: list[str] = []
@@ -1711,13 +1712,13 @@ async def _verify_tractor_invoice_results(
                 if log:
                     if date_ok:
                         log(
-                            "SPS: result rows include Tractor Supply Dropship invoices "
+                            f"SPS: result rows include {partner_label} invoices "
                             f"for {report_day.isoformat()} "
                             f"({len(tractor_invoice)}/{len(rows)} visible row sample(s))."
                         )
                     else:
                         log(
-                            "SPS: visible rows include Tractor Supply Dropship invoices; "
+                            f"SPS: visible rows include {partner_label} invoices; "
                             f"date text did not all include {report_day.isoformat()} "
                             "(search date filter already applied). Proceeding to download."
                         )
@@ -1728,7 +1729,7 @@ async def _verify_tractor_invoice_results(
         sample = " | ".join(last_rows[:3])
         if log:
             log(
-                "SPS: could not read Tractor Supply + Invoice on visible rows "
+                f"SPS: could not read {partner_label} + Invoice on visible rows "
                 f"(sample: {sample}). Matching Results is {result_count}; "
                 "proceeding to Select All using the search filters."
             )
@@ -2353,19 +2354,45 @@ async def _sps_select_document_type_invoice(page: Page, doc, *, log=None) -> Non
 
 
 async def _fill_sps_advanced_search_date_and_invoice(
-    page: Page, report_day: date, *, step_timeout_ms: int, log=None
+    page: Page,
+    report_day: date,
+    *,
+    step_timeout_ms: int,
+    log=None,
+    partner_name: str = "Tractor Supply Dropship",
+    keep_date_and_document_type: bool = False,
 ) -> None:
     # Scope the report before setting date/type. Without Partner, SPS returns
     # invoices for every retailer and the postprocessor cannot distinguish them.
     await _sps_select_partner(
         page,
-        "Tractor Supply Dropship",
+        partner_name,
         step_timeout_ms=step_timeout_ms,
         log=log,
     )
     # Cornerstone-generated invoices are outbound. Keep archived documents out.
     await _sps_select_radio_filter(page, "Outbound", log=log)
     await _sps_select_radio_filter(page, "Exclude", log=log)
+
+    if keep_date_and_document_type:
+        date_loc = await _locate_sps_custom_date_input(page)
+        date_shown = ""
+        if date_loc is not None:
+            try:
+                date_shown = (await date_loc.input_value() or "").strip()
+            except Exception:
+                date_shown = ""
+        invoice_ok = await _sps_filter_token_selected(page, "Invoice")
+        if date_shown and invoice_ok:
+            if log:
+                log(
+                    "SPS: keeping the date range and Document Type Invoice "
+                    f"already set ({date_shown})."
+                )
+            await _sps_dismiss_open_listboxes(page, log=log)
+            return
+        if log:
+            log("SPS: date or Document Type was cleared; setting them again.")
 
     await _lift_sps_ui_blockers(page, log)
     date_loc = await _locate_sps_custom_date_input(page)
@@ -3140,8 +3167,9 @@ async def _save_tractor_playwright_download(
     download_dir: Path,
     report_day: date,
     log,
+    raw_prefix: str = "_sps_tractor_raw",
 ) -> Path:
-    dest = download_dir / f"_sps_tractor_raw_{report_day.isoformat()}.csv"
+    dest = download_dir / f"{raw_prefix}_{report_day.isoformat()}.csv"
     await dl.save_as(str(dest))
     await asyncio.sleep(2.5)
     await _wait_tractor_download_file_ready(dest, log=log)
@@ -3183,6 +3211,7 @@ async def _download_tractor_bulk_csv(
     expected_count: int,
     download_timeout_ms: int,
     log,
+    raw_prefix: str = "_sps_tractor_raw",
 ) -> Path:
     # Avoid Escape here — it can dismiss the combine-CSV dialog opened right after bulk download.
     await _sps_disable_pointer_blocking_backdrops(page, log)
@@ -3207,6 +3236,7 @@ async def _download_tractor_bulk_csv(
             download_dir=download_dir,
             report_day=report_day,
             log=log,
+            raw_prefix=raw_prefix,
         )
 
     # One selected invoice never opens "Combine documents into one CSV".
@@ -3226,6 +3256,7 @@ async def _download_tractor_bulk_csv(
                 download_dir=download_dir,
                 report_day=report_day,
                 log=log,
+                raw_prefix=raw_prefix,
             )
         if not await _combine_csv_modal_visible(page):
             if log:
@@ -3319,23 +3350,31 @@ async def run_tractor_sps_search_and_download_csv(
     nav_timeout_ms: int,
     download_timeout_ms: int,
     log,
+    partner_name: str = "Tractor Supply Dropship",
+    raw_prefix: str = "_sps_tractor_raw",
+    keep_date_and_document_type: bool = False,
 ) -> Path | None:
     """
-    Advanced Search must already be open. Applies previous-business-day range + Invoice, runs search,
-    selects all when results > 0, then saves the CSV. One invoice downloads from the cloud click.
-    Several invoices use the combine-CSV dialog, then the downloads list.
+    Advanced Search must already be open. Applies the partner, outbound, archived-exclude,
+    report-day range, and Document Type Invoice, then saves the CSV. One invoice downloads
+    from the cloud click. Several invoices use the combine-CSV dialog, then the downloads list.
     Returns path to the saved temp CSV, or None when Matching Results is 0.
     """
     step_timeout = min(180_000, max(45_000, nav_timeout_ms))
     await _wait_sps_advanced_search_actionable(page, timeout_ms=step_timeout, log=log)
     if log:
         log(
-            "SPS: Advanced Search — Partner Tractor Supply Dropship, Direction Outbound, "
+            f"SPS: Advanced Search — Partner {partner_name}, Direction Outbound, "
             f"Archived Exclude, custom date range {sps_custom_date_range_value(report_day)} "
             f"(report day {report_day.isoformat()}), Document Type Invoice…"
         )
     await _fill_sps_advanced_search_date_and_invoice(
-        page, report_day, step_timeout_ms=step_timeout, log=log
+        page,
+        report_day,
+        step_timeout_ms=step_timeout,
+        log=log,
+        partner_name=partner_name,
+        keep_date_and_document_type=keep_date_and_document_type,
     )
 
     results_timeout = min(120_000, max(60_000, nav_timeout_ms // 2))
@@ -3388,6 +3427,8 @@ async def run_tractor_sps_search_and_download_csv(
         report_day=report_day,
         timeout_ms=8_000,
         log=log,
+        partner_text=partner_name,
+        partner_label=partner_name,
     )
     await _click_select_all_transactions(page, log=log)
     if log:
@@ -3399,8 +3440,24 @@ async def run_tractor_sps_search_and_download_csv(
         expected_count=n,
         download_timeout_ms=download_timeout_ms,
         log=log,
+        raw_prefix=raw_prefix,
     )
     return raw_path
+
+
+class SpsGraingerInvoiceError(RuntimeError):
+    """Grainger failed after Tractor Supply. ``tractor_raw`` may still be on disk."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        tractor_raw: Path | None,
+        grainger_raw: Path | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.tractor_raw = tractor_raw
+        self.grainger_raw = grainger_raw
 
 
 async def run_sps_tractor_transactions_and_advanced_search(
@@ -3411,15 +3468,21 @@ async def run_sps_tractor_transactions_and_advanced_search(
     nav_timeout_ms: int = 120_000,
     download_timeout_ms: int = 600_000,
     log,
-) -> Path | None:
+) -> tuple[Path | None, Path | None]:
     """
-    New tab: SPS login → transactions list → Advanced Search → Partner Tractor Supply Dropship
-    + Direction Outbound + Archived Exclude + previous business day + Document Type Invoice →
-    Search → select all → CSV download → temp file under ``download_dir``.
-    Returns ``None`` when there are zero matching results.
+    New tab: SPS login → transactions → Advanced Search → Tractor Supply invoice CSV,
+    then the same search with Partner Grainger (date and Document Type left as set).
+    Returns ``(tractor_raw, grainger_raw)``. Either path is ``None`` when that partner
+    has zero matching invoices.
+
+    If Grainger fails after Tractor Supply downloaded, raises ``SpsGraingerInvoiceError``
+    with ``tractor_raw`` still set.
     """
     download_dir = Path(download_dir).resolve()
     page = await context.new_page()
+    tractor_raw: Path | None = None
+    grainger_raw: Path | None = None
+    grainger_error: BaseException | None = None
     try:
         log("SPS Commerce: logging in and opening transactions…")
         await login_sps_and_open_transactions(
@@ -3434,7 +3497,7 @@ async def run_sps_tractor_transactions_and_advanced_search(
             page, step_timeout_ms=min(180_000, nav_timeout_ms), log=log
         )
         log("SPS Commerce: running Tractor Supply invoice search and CSV export…")
-        return await run_tractor_sps_search_and_download_csv(
+        tractor_raw = await run_tractor_sps_search_and_download_csv(
             page,
             report_day=report_day,
             download_dir=download_dir,
@@ -3442,6 +3505,36 @@ async def run_sps_tractor_transactions_and_advanced_search(
             download_timeout_ms=download_timeout_ms,
             log=log,
         )
+        log("SPS Commerce: back to Advanced Search for Grainger invoices…")
+        await _sps_dismiss_success_download_toast(page, log)
+        await open_advanced_search_panel(
+            page, step_timeout_ms=min(180_000, nav_timeout_ms), log=log
+        )
+        try:
+            grainger_raw = await run_tractor_sps_search_and_download_csv(
+                page,
+                report_day=report_day,
+                download_dir=download_dir,
+                nav_timeout_ms=nav_timeout_ms,
+                download_timeout_ms=download_timeout_ms,
+                log=log,
+                partner_name="Grainger",
+                raw_prefix="_sps_grainger_raw",
+                keep_date_and_document_type=True,
+            )
+        except Exception as exc:
+            grainger_error = exc
+            log(f"SPS Commerce: Grainger invoice download failed: {exc}")
     finally:
         await asyncio.sleep(2.0)
-        await page.close()
+        try:
+            await page.close()
+        except Exception:
+            pass
+    if grainger_error is not None:
+        raise SpsGraingerInvoiceError(
+            str(grainger_error),
+            tractor_raw=tractor_raw,
+            grainger_raw=grainger_raw,
+        ) from grainger_error
+    return tractor_raw, grainger_raw

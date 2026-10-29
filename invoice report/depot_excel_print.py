@@ -1,7 +1,7 @@
 """
 Print workbooks via Excel COM (Windows): Page Layout → Print gridlines; landscape; print header
-(file name) and footer (``Page n of m``); chosen printer. Depot, Lowe's, and Tractor Supply use the
-same landscape print path (Depot, Lowe's, Tractor, Amazon).
+(file name) and footer (``Page n of m``); chosen printer. Depot, Lowe's, Tractor Supply, and Grainger use the
+same landscape print path (Depot, Lowe's, Tractor, Grainger, Amazon).
 
 Requires Microsoft Excel and: pip install pywin32
 """
@@ -215,7 +215,7 @@ def _print_workbook_with_gridlines(
 def print_landscape_with_gridlines(workbook_path: Path) -> None:
     """
     Page Layout equivalent: Print gridlines; landscape; print header (file name) and footer
-    (Page n of m); print to COMMERCEHUB_EXCEL_PRINTER if set. Used for Depot, Lowe's, and Tractor.
+    (Page n of m); print to COMMERCEHUB_EXCEL_PRINTER if set. Used for Depot, Lowe's, Tractor, and Grainger.
     """
     _print_workbook_with_gridlines(
         workbook_path, orientation=_XL_LANDSCAPE, save_changes=True

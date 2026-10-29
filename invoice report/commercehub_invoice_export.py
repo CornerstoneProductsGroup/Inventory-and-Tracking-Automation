@@ -1,8 +1,8 @@
 """
-Automate CommerceHub (Rithum) DSM and SPS Commerce (Tractor Supply): invoicing flows with an interactive menu.
+Automate CommerceHub (Rithum) DSM and SPS Commerce (Tractor Supply, then Grainger): invoicing flows with an interactive menu.
 
-On run, choose: (1) All — parallel: CommerceHub (Depot + Lowe's, one browser) and SPS Tractor Supply (second browser);
-(2) Depot only, (3) Lowe's only, (4) Tractor Supply (SPS), (5) Depot + Lowe's on CommerceHub only.
+On run, choose: (1) All — parallel: CommerceHub (Depot + Lowe's, one browser) and SPS Tractor Supply then Grainger (second browser);
+(2) Depot only, (3) Lowe's only, (4) Tractor Supply then Grainger (SPS), (5) Depot + Lowe's on CommerceHub only.
 Optional CLI: ``python commercehub_invoice_export.py retail`` or env ``COMMERCEHUB_MENU_CHOICE=1`` (all) / ``5`` (retail).
 Custom date: ``python commercehub_invoice_export.py all --date 2026-05-23`` or env ``COMMERCEHUB_REPORT_DATE=5/23/2026``.
 
@@ -36,9 +36,11 @@ from commercehub_previous_business_day import (
 from depot_invoice_postprocess import (
     InvoiceExportEmpty,
     process_invoice_download,
+    save_grainger_invoice_csv,
     save_tractor_supply_csv,
 )
 from sps_commerce_flow import (
+    SpsGraingerInvoiceError,
     load_sps_env_from_inventory_project,
     run_sps_tractor_transactions_and_advanced_search,
     sps_chromium_launch_args,
@@ -302,10 +304,10 @@ _MENU_KEYS = {"1": "all", "2": "depot", "3": "lowes", "4": "tractor", "5": "reta
 def prompt_run_menu() -> str:
     print()
     print("Select invoicing run:")
-    print("  1 - All (parallel: CommerceHub Depot+Lowe's, and SPS Tractor)")
+    print("  1 - All (parallel: CommerceHub Depot+Lowe's, and SPS Tractor then Grainger)")
     print("  2 - Depot only (CommerceHub)")
     print("  3 - Lowe's only (CommerceHub)")
-    print("  4 - Tractor Supply only (SPS Commerce)")
+    print("  4 - Tractor Supply then Grainger (SPS Commerce)")
     print("  5 - Depot + Lowe's only (CommerceHub, one browser)")
     print()
     while True:
@@ -982,13 +984,47 @@ async def _run_lowes_invoice_flow(page, download_dir: Path, report_day) -> Path 
     return _postprocess_retail_export(path_l, report_day, "lowes", retailer_label="Lowe's")
 
 
+def _publish_sps_partner_invoice(
+    raw: Path | None,
+    report_day: date,
+    *,
+    label: str,
+    save_fn,
+    review_tag: str,
+    print_tag: str,
+) -> Path | None:
+    if raw is None:
+        _log(f"{label}: no matching invoices for the report day — no report saved.")
+        return None
+    out, review_notes = save_fn(raw, report_day)
+    _log(f"{label}: saved {out}")
+    if review_notes:
+        _log(f"{label}: {len(review_notes)} item(s) to review before QuickBooks:")
+        for note in review_notes:
+            _log(f"  [{review_tag}] {note}")
+    try:
+        from depot_excel_print import print_landscape_with_gridlines
+
+        print_landscape_with_gridlines(out)
+    except Exception as e:
+        import traceback
+
+        _log(f"[{print_tag}] Excel print step failed (workbook was saved): {e}")
+        traceback.print_exc()
+    try:
+        raw.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return out
+
+
 async def _run_sps_tractor_phase(
     context,
     *,
     nav_timeout_ms: int,
     report_day: date,
     download_dir: Path,
-) -> Path | None:
+) -> tuple[Path | None, Path | None]:
     load_project_dotenv()
     load_sps_env_from_inventory_project(override=False)
     sps_user = (os.environ.get("SPS_USERNAME") or "").strip()
@@ -1003,37 +1039,58 @@ async def _run_sps_tractor_phase(
             f"Put them in {_ENV_FILE} (exact names SPS_USERNAME and SPS_PASSWORD), "
             "or set COMMERCEHUB_SPS_DOTENV to another .env that contains them."
         )
-    raw = await run_sps_tractor_transactions_and_advanced_search(
-        context,
-        report_day=report_day,
-        download_dir=download_dir,
-        nav_timeout_ms=nav_timeout_ms,
-        download_timeout_ms=DOWNLOAD_TIMEOUT_MS,
-        log=_log,
-    )
-    if raw is None:
-        _log("Tractor Supply (SPS): no matching invoices for the report day — no report saved.")
-        return None
-    out, review_notes = save_tractor_supply_csv(raw, report_day)
-    _log(f"Tractor Supply (SPS): saved {out}")
-    if review_notes:
-        _log(f"Tractor Supply (SPS): {len(review_notes)} item(s) to review before QuickBooks:")
-        for note in review_notes:
-            _log(f"  [tractor:review] {note}")
+    tractor_raw: Path | None = None
+    grainger_raw: Path | None = None
+    grainger_error: BaseException | None = None
     try:
-        from depot_excel_print import print_landscape_with_gridlines
+        tractor_raw, grainger_raw = await run_sps_tractor_transactions_and_advanced_search(
+            context,
+            report_day=report_day,
+            download_dir=download_dir,
+            nav_timeout_ms=nav_timeout_ms,
+            download_timeout_ms=DOWNLOAD_TIMEOUT_MS,
+            log=_log,
+        )
+    except SpsGraingerInvoiceError as exc:
+        tractor_raw = exc.tractor_raw
+        grainger_raw = exc.grainger_raw
+        grainger_error = exc
 
-        print_landscape_with_gridlines(out)
-    except Exception as e:
-        import traceback
-
-        _log(f"[invoice:tractor] Excel print step failed (workbook was saved): {e}")
-        traceback.print_exc()
+    saved: list[BaseException] = []
+    tractor_out: Path | None = None
+    grainger_out: Path | None = None
     try:
-        raw.unlink(missing_ok=True)
-    except OSError:
-        pass
-    return out
+        tractor_out = _publish_sps_partner_invoice(
+            tractor_raw,
+            report_day,
+            label="Tractor Supply (SPS)",
+            save_fn=save_tractor_supply_csv,
+            review_tag="tractor:review",
+            print_tag="invoice:tractor",
+        )
+    except Exception as exc:
+        _log(f"Tractor Supply (SPS): could not save the workbook: {exc}")
+        saved.append(exc)
+    if grainger_raw is None and grainger_error is not None:
+        _log(f"Grainger (SPS): download failed, so no workbook was saved: {grainger_error}")
+    else:
+        try:
+            grainger_out = _publish_sps_partner_invoice(
+                grainger_raw,
+                report_day,
+                label="Grainger (SPS)",
+                save_fn=save_grainger_invoice_csv,
+                review_tag="grainger:review",
+                print_tag="invoice:grainger",
+            )
+        except Exception as exc:
+            _log(f"Grainger (SPS): could not save the workbook: {exc}")
+            saved.append(exc)
+    if grainger_error is not None:
+        saved.append(grainger_error)
+    if saved:
+        raise saved[0]
+    return tractor_out, grainger_out
 
 
 async def _run_tractor_standalone_browser(
@@ -1041,8 +1098,8 @@ async def _run_tractor_standalone_browser(
     download_dir: Path,
     headless: bool,
     report_day: date,
-) -> Path | None:
-    """SPS Tractor Supply in its own Chromium instance (parallel with CommerceHub when mode is ``all``)."""
+) -> tuple[Path | None, Path | None]:
+    """SPS Tractor Supply then Grainger in one Chromium instance (parallel with CommerceHub when mode is ``all``)."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=headless,
@@ -1062,7 +1119,7 @@ async def _run_tractor_standalone_browser(
         finally:
             await context.close()
             await browser.close()
-            _log("SPS Tractor browser closed.")
+            _log("SPS Tractor / Grainger browser closed.")
 
 
 async def _run_commercehub_invoice_browser(
@@ -1109,7 +1166,7 @@ async def _run_commercehub_invoice_browser(
 
 async def run_export(
     mode: str = "all", *, report_day: date | None = None
-) -> tuple[Path | None, Path | None, Path | None]:
+) -> tuple[Path | None, Path | None, Path | None, Path | None]:
     load_project_dotenv()
     mode = mode.strip().lower()
     allowed = frozenset({"all", "depot", "lowes", "tractor", "retail"})
@@ -1132,17 +1189,17 @@ async def run_export(
         _log(f"Report day: {day.isoformat()} (previous business day)")
 
     if mode == "tractor":
-        tractor_path = await _run_tractor_standalone_browser(
+        tractor_path, grainger_path = await _run_tractor_standalone_browser(
             download_dir=download_dir,
             headless=headless,
             report_day=day,
         )
-        return (None, None, tractor_path)
+        return None, None, tractor_path, grainger_path
 
     if mode == "all":
         _log(
             "Parallel: CommerceHub (Depot then Lowe's, one browser) + "
-            "SPS Commerce / Tractor Supply (second browser)."
+            "SPS Commerce / Tractor Supply then Grainger (second browser)."
         )
         ch_result, tractor_result = await asyncio.gather(
             _run_commercehub_invoice_browser(
@@ -1161,18 +1218,30 @@ async def run_export(
         )
         if isinstance(ch_result, BaseException):
             if isinstance(tractor_result, BaseException):
-                _log(f"ERROR: Tractor Supply invoice report also failed: {tractor_result}")
-            elif tractor_result is not None:
-                _log(f"Tractor Supply report was saved despite CommerceHub failure: {tractor_result}")
+                _log(f"ERROR: SPS Tractor/Grainger invoice report also failed: {tractor_result}")
+            elif isinstance(tractor_result, tuple):
+                saved_tractor, saved_grainger = tractor_result
+                if saved_tractor is not None:
+                    _log(
+                        "Tractor Supply report was saved despite CommerceHub failure: "
+                        f"{saved_tractor}"
+                    )
+                if saved_grainger is not None:
+                    _log(
+                        f"Grainger report was saved despite CommerceHub failure: {saved_grainger}"
+                    )
             raise ch_result
         depot_path, lowes_path = ch_result
         if isinstance(tractor_result, BaseException):
             _log(
-                f"ERROR: Tractor Supply invoice report failed ({tractor_result}). "
+                f"ERROR: SPS Tractor/Grainger invoice report failed ({tractor_result}). "
                 "Depot/Lowe's reports were kept."
             )
-            raise RuntimeError(f"Tractor Supply invoice report failed: {tractor_result}") from tractor_result
-        return depot_path, lowes_path, tractor_result
+            raise RuntimeError(
+                f"SPS Tractor/Grainger invoice report failed: {tractor_result}"
+            ) from tractor_result
+        tractor_path, grainger_path = tractor_result
+        return depot_path, lowes_path, tractor_path, grainger_path
 
     if mode == "retail":
         d, l = await _run_commercehub_invoice_browser(
@@ -1182,7 +1251,7 @@ async def run_export(
             headless=headless,
             report_day=day,
         )
-        return d, l, None
+        return d, l, None, None
 
     if mode == "depot":
         d, l = await _run_commercehub_invoice_browser(
@@ -1192,7 +1261,7 @@ async def run_export(
             headless=headless,
             report_day=day,
         )
-        return d, l, None
+        return d, l, None, None
 
     if mode == "lowes":
         d, l = await _run_commercehub_invoice_browser(
@@ -1202,7 +1271,7 @@ async def run_export(
             headless=headless,
             report_day=day,
         )
-        return d, l, None
+        return d, l, None, None
 
     raise AssertionError(f"unhandled mode {mode!r}")
 
@@ -1212,7 +1281,9 @@ def main(argv: list[str] | None = None) -> None:
     try:
         argv, report_day = resolve_report_day(argv)
         mode = resolve_run_mode(argv)
-        depot_out, lowes_out, tractor_out = asyncio.run(run_export(mode, report_day=report_day))
+        depot_out, lowes_out, tractor_out, grainger_out = asyncio.run(
+            run_export(mode, report_day=report_day)
+        )
         if depot_out is not None:
             _log(f"Done Depot: {depot_out}")
         elif mode in ("depot", "retail", "all"):
@@ -1225,6 +1296,10 @@ def main(argv: list[str] | None = None) -> None:
             _log(f"Done Tractor Supply: {tractor_out}")
         elif mode in ("tractor", "all") and tractor_out is None:
             _log("Tractor Supply (SPS): finished — no invoices for the report day (0 results).")
+        if grainger_out is not None:
+            _log(f"Done Grainger: {grainger_out}")
+        elif mode in ("tractor", "all") and grainger_out is None:
+            _log("Grainger (SPS): finished — no invoices for the report day (0 results).")
     except Exception as e:  # noqa: BLE001 — surface any failure to scheduler logs
         _log(f"ERROR: {e}")
         traceback.print_exc(file=sys.stderr)

@@ -26,7 +26,7 @@ Optional skips: --skip-commercehub, --skip-sps-inventory, --skip-sps-tracking,
 If any step fails (e.g. no invoices for a closed day), later phases still run. At the end,
 a WORKFLOW RUN SUMMARY lists skipped steps (e.g. empty Rithum queues) and all errors.
 Use --invoice-report-only to run only phase 0 (combine with --invoice-report-modes).
-Use --invoice-report-date YYYY-MM-DD (or MM/DD/YYYY) for a custom invoice report day (Depot, Lowe's, Tractor).
+Use --invoice-report-date YYYY-MM-DD (or MM/DD/YYYY) for a custom invoice report day (Depot, Lowe's, Tractor, Grainger).
 Use --tracking-invoicing-only to skip inventories and run tracking lanes only.
 Use --pull-orders-only to run only the morning order pull (CommerceHub PDF/CSV, then SPS Tractor/Grainger).
 Use --fedex-batch-only to run only FedEx batch shipping (Lowe's CSV upload + labels).
@@ -517,11 +517,11 @@ def _run_step_sequence(step_list: list[tuple[str, list[str], Path]]) -> list[str
 
 
 _INVOICE_MODE_LABELS = {
-    "all": "All (parallel: CH Depot+Lowe's + SPS Tractor)",
+    "all": "All (parallel: CH Depot+Lowe's + SPS Tractor then Grainger)",
     "retail": "Depot + Lowe's (CommerceHub, one browser)",
     "depot": "Depot",
     "lowes": "Lowe's",
-    "tractor": "Tractor Supply",
+    "tractor": "Tractor Supply then Grainger",
 }
 
 
@@ -826,7 +826,7 @@ def main() -> int:
         metavar="MODE",
         help=(
             "Modes for commercehub_invoice_export.py: all, retail, depot, lowes, tractor. "
-            "Default when invoices run: all (parallel: CommerceHub Depot+Lowe's, SPS Tractor). "
+            "Default when invoices run: all (parallel: CommerceHub Depot+Lowe's, SPS Tractor then Grainger). "
             "depot+lowes together is normalized to one retail run. depot+lowes+tractor becomes all."
         ),
     )
@@ -840,7 +840,7 @@ def main() -> int:
         metavar="DATE",
         default=None,
         help=(
-            "Custom calendar date for invoice reports (Depot, Lowe's, Tractor Supply). "
+            "Custom calendar date for invoice reports (Depot, Lowe's, Tractor Supply, Grainger). "
             "Formats: YYYY-MM-DD or MM/DD/YYYY. Default is previous business day."
         ),
     )

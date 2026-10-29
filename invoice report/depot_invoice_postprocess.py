@@ -1,5 +1,5 @@
 """
-Post-process CommerceHub invoice exports (Depot / Lowe's / Tractor): Accounting, PO line dedupe, totals, UNC xlsx, Excel print.
+Post-process CommerceHub invoice exports (Depot / Lowe's / Tractor / Grainger): Accounting, PO line dedupe, totals, UNC xlsx, Excel print.
 
 Same column layout for both retailers; output folder and filename prefix differ by retailer.
 """
@@ -23,6 +23,7 @@ from openpyxl.utils import get_column_letter
 DEFAULT_DEPOT_OUTPUT_DIR = r"\\rygarcorp.com\shares\Cornerstone\Invoice Reports\Depot"
 DEFAULT_LOWE_OUTPUT_DIR = r"\\rygarcorp.com\shares\Cornerstone\Invoice Reports\Lowe's"
 DEFAULT_TRACTOR_OUTPUT_DIR = r"\\rygarcorp.com\shares\Cornerstone\Invoice Reports\Tractor Supply"
+DEFAULT_GRAINGER_OUTPUT_DIR = r"\\rygarcorp.com\shares\Cornerstone\Invoice Reports\Grainger"
 
 # Excel accounting format; backslashes must be literal (raw string avoids SyntaxWarning).
 _DEFAULT_ACCOUNTING_NUMBER_FORMAT = (
@@ -53,6 +54,11 @@ def lowes_report_filename(report_day: date) -> str:
 def tractor_report_filename(report_day: date) -> str:
     """Tractor workbook name aligned with Depot/Lowe's date style (month-day-year, no leading zeros)."""
     return f"Tractor Supply Invoice Report {report_day.month}-{report_day.day}-{report_day.year}.xlsx"
+
+
+def grainger_report_filename(report_day: date) -> str:
+    """Grainger workbook name aligned with Depot/Lowe's date style (month-day-year, no leading zeros)."""
+    return f"Grainger Invoice Report {report_day.month}-{report_day.day}-{report_day.year}.xlsx"
 
 
 def _excel_col_letters_to_zero_based(letters: str) -> int:
@@ -127,7 +133,7 @@ def _tractor_read_plain_csv_file(path: Path) -> list[list[str]]:
         return list(csv.reader(f))
 
 
-def _tractor_csv_rows_from_download(path: Path) -> list[list[str]]:
+def _tractor_csv_rows_from_download(path: Path, *, source_label: str = "Tractor") -> list[list[str]]:
     """
     SPS often delivers a ZIP of per-invoice CSVs (still named ``.csv`` on disk).
     Plain CSV is returned as-is; ZIP members ending in ``.csv`` are merged (one header).
@@ -143,7 +149,7 @@ def _tractor_csv_rows_from_download(path: Path) -> list[list[str]]:
             )
             if not names:
                 raise RuntimeError(
-                    f"Tractor SPS download is a ZIP but contains no .csv entries: {path}"
+                    f"{source_label} SPS download is a ZIP but contains no .csv entries: {path}"
                 )
             for name in names:
                 info = zf.getinfo(name)
@@ -535,6 +541,252 @@ def save_tractor_supply_csv(source: Path, report_day: date) -> tuple[Path, list[
 
     _apply_openpyxl_print_file_and_page_footer(ws)
 
+    return _save_xlsx_or_fallback(wb, out_path), review_notes
+
+
+# Raw Grainger SPS columns. Quantity, unit price, and SKU start on the second
+# row of each PO. Column CA repeats the invoice total on every row of that PO.
+_GRAINGER_COL_PO = _excel_col_letters_to_zero_based("A")
+_GRAINGER_COL_DATE = _excel_col_letters_to_zero_based("B")
+_GRAINGER_COL_QTY_RAW = _excel_col_letters_to_zero_based("M")
+_GRAINGER_COL_PRICE_RAW = _excel_col_letters_to_zero_based("O")
+_GRAINGER_COL_SKU_RAW = _excel_col_letters_to_zero_based("S")
+_GRAINGER_COL_TOTAL_RAW = _excel_col_letters_to_zero_based("CA")
+_GRAINGER_OUT_QTY = 3
+_GRAINGER_OUT_PRICE = 4
+_GRAINGER_OUT_TOTAL = 6
+_GRAINGER_DEFAULT_HEADERS = (
+    "PO#",
+    "Invoice Date",
+    "Quantity",
+    "Unit Price",
+    "SKU",
+    "Invoice Total",
+)
+_GRAINGER_COLUMN_WIDTHS: dict[str, float] = {
+    "A": 16.0,
+    "B": 14.0,
+    "C": 12.0,
+    "D": 12.0,
+    "E": 42.0,
+    "F": 16.0,
+}
+
+
+def _grainger_cell(row: list[str], index: int) -> str:
+    if index >= len(row):
+        return ""
+    return (row[index] or "").strip()
+
+
+def _grainger_header_labels(header: list[str] | None) -> list[str]:
+    if not header:
+        return list(_GRAINGER_DEFAULT_HEADERS)
+    picked = [
+        _grainger_cell(header, _GRAINGER_COL_PO),
+        _grainger_cell(header, _GRAINGER_COL_DATE),
+        _grainger_cell(header, _GRAINGER_COL_QTY_RAW),
+        _grainger_cell(header, _GRAINGER_COL_PRICE_RAW),
+        _grainger_cell(header, _GRAINGER_COL_SKU_RAW),
+        _grainger_cell(header, _GRAINGER_COL_TOTAL_RAW),
+    ]
+    return [
+        picked[i] or _GRAINGER_DEFAULT_HEADERS[i] for i in range(len(_GRAINGER_DEFAULT_HEADERS))
+    ]
+
+
+def _grainger_row_is_header(row: list[str]) -> bool:
+    label = re.sub(r"\s+", " ", _grainger_cell(row, _GRAINGER_COL_PO).lower())
+    if label in {
+        "po",
+        "po#",
+        "po #",
+        "p.o.",
+        "p.o. #",
+        "po number",
+        "purchase order",
+        "purchase order number",
+        "order number",
+    }:
+        return True
+    sku = _grainger_cell(row, _GRAINGER_COL_SKU_RAW).lower()
+    qty = _grainger_cell(row, _GRAINGER_COL_QTY_RAW).lower()
+    if any(token in sku for token in ("sku", "description", "item")):
+        return True
+    if "qty" in qty or "quantity" in qty:
+        return True
+    total = _tractor_coerce_numeric(_grainger_cell(row, _GRAINGER_COL_TOTAL_RAW))
+    return total is None and not re.search(r"\d", label)
+
+
+def _grainger_po_blocks(data_rows: list[list[str]]) -> list[list[list[str]]]:
+    """Group consecutive raw rows that belong to one PO number."""
+    blocks: list[list[list[str]]] = []
+    current: list[list[str]] = []
+    current_po = ""
+    for row in data_rows:
+        if not any(_grainger_cell(row, i) for i in range(max(len(row), 1))):
+            continue
+        po = _grainger_cell(row, _GRAINGER_COL_PO)
+        if po and po != current_po:
+            if current:
+                blocks.append(current)
+            current = [row]
+            current_po = po
+            continue
+        if current:
+            current.append(row)
+        elif po:
+            current = [row]
+            current_po = po
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _grainger_output_rows(raw_rows: list[list[str]], notes: list[str]) -> list[list[str]]:
+    """
+    One output row per SKU. PO number and invoice date come from the first raw
+    row of the PO. Quantity, unit price, and SKU come from each following raw
+    row. Invoice total is taken from the first raw row and written once.
+    """
+    if not raw_rows:
+        return []
+    header = raw_rows[0] if _grainger_row_is_header(raw_rows[0]) else None
+    data = raw_rows[1:] if header is not None else raw_rows
+    out: list[list[str]] = [_grainger_header_labels(header)]
+    for block in _grainger_po_blocks(data):
+        first = block[0]
+        po = _grainger_cell(first, _GRAINGER_COL_PO)
+        inv_date = _grainger_cell(first, _GRAINGER_COL_DATE)
+        total = _grainger_cell(first, _GRAINGER_COL_TOTAL_RAW)
+        sku_lines: list[tuple[str, str, str]] = []
+        for row in block[1:]:
+            qty = _grainger_cell(row, _GRAINGER_COL_QTY_RAW)
+            price = _grainger_cell(row, _GRAINGER_COL_PRICE_RAW)
+            sku = _grainger_cell(row, _GRAINGER_COL_SKU_RAW)
+            if not qty and not price and not sku:
+                continue
+            sku_lines.append((qty, price, sku))
+            missing = [
+                name
+                for name, value in (("Quantity", qty), ("Unit Price", price), ("SKU", sku))
+                if not value
+            ]
+            if missing:
+                _tractor_note(
+                    notes,
+                    f"Grainger PO {po} SKU {sku or '(blank)'}: missing {', '.join(missing)}.",
+                )
+        if not sku_lines:
+            _tractor_note(
+                notes,
+                f"Grainger PO {po or '(blank)'}: no SKU rows after the first line.",
+            )
+            out.append([po, inv_date, "", "", "", total])
+            continue
+        if len(sku_lines) == 1:
+            qty, price, sku = sku_lines[0]
+            qty_n = _tractor_coerce_numeric(qty)
+            price_n = _tractor_coerce_numeric(price)
+            total_n = _tractor_coerce_numeric(total)
+            if (
+                isinstance(qty_n, (int, float))
+                and isinstance(price_n, (int, float))
+                and isinstance(total_n, (int, float))
+                and abs(float(qty_n) * float(price_n) - float(total_n)) > _TRACTOR_AMOUNT_TOLERANCE
+            ):
+                _tractor_note(
+                    notes,
+                    f"Grainger PO {po} SKU {sku or '(blank)'}: qty ({qty_n}) × unit price "
+                    f"({price_n}) = {float(qty_n) * float(price_n):.2f} but invoice total is "
+                    f"{float(total_n):.2f}.",
+                )
+        for index, (qty, price, sku) in enumerate(sku_lines):
+            out.append([po, inv_date, qty, price, sku, total if index == 0 else ""])
+    return out
+
+
+def save_grainger_invoice_csv(source: Path, report_day: date) -> tuple[Path, list[str]]:
+    """
+    Read the SPS Grainger download and write one row per SKU (six columns) to the
+    Grainger invoice share. Invoice total is listed once per PO so the SUM row
+    does not repeat it for extra SKUs.
+
+    Returns ``(workbook_path, review_notes)``.
+    Uses COMMERCEHUB_GRAINGER_OUTPUT_DIR and COMMERCEHUB_OUTPUT_FALLBACK_DIR.
+    """
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    review_notes: list[str] = []
+    rows = _grainger_output_rows(
+        _tractor_csv_rows_from_download(source, source_label="Grainger"),
+        review_notes,
+    )
+    if len(rows) <= 1:
+        raise RuntimeError("Grainger SPS export produced no invoice rows after download merge.")
+
+    out_dir = Path(os.environ.get("COMMERCEHUB_GRAINGER_OUTPUT_DIR", DEFAULT_GRAINGER_OUTPUT_DIR))
+    out_path = out_dir / grainger_report_filename(report_day)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Invoice Report"
+    header_row = 1
+    first_data = 2
+
+    for c, text in enumerate(rows[0], start=1):
+        cell = ws.cell(row=header_row, column=c, value=text)
+        cell.font = Font(bold=True)
+
+    for ri, row in enumerate(rows[1:], start=first_data):
+        for ci, val in enumerate(row, start=1):
+            if ci == _GRAINGER_OUT_QTY:
+                num = _tractor_coerce_numeric(val)
+                if isinstance(num, (int, float)):
+                    ws.cell(row=ri, column=ci, value=int(num) if num == int(num) else num)
+                elif not str(val).strip():
+                    ws.cell(row=ri, column=ci, value=None)
+                else:
+                    ws.cell(row=ri, column=ci, value=val)
+            elif ci in (_GRAINGER_OUT_PRICE, _GRAINGER_OUT_TOTAL):
+                num = _tractor_coerce_numeric(val)
+                if isinstance(num, (int, float)):
+                    ws.cell(row=ri, column=ci, value=num)
+                elif not str(val).strip():
+                    ws.cell(row=ri, column=ci, value=None)
+                else:
+                    ws.cell(row=ri, column=ci, value=val)
+            else:
+                ws.cell(row=ri, column=ci, value=val if str(val).strip() else None)
+
+    acct = _accounting_format()
+    last_data = header_row + len(rows) - 1
+    sum_row: int | None = None
+    if last_data >= first_data:
+        sum_row = last_data + 1
+        lf = get_column_letter(_GRAINGER_OUT_TOTAL)
+        ws.cell(
+            row=sum_row,
+            column=_GRAINGER_OUT_TOTAL,
+            value=f"=SUM({lf}{first_data}:{lf}{last_data})",
+        )
+        for ri in range(first_data, last_data + 1):
+            ws.cell(row=ri, column=_GRAINGER_OUT_PRICE).number_format = acct
+        for ri in range(header_row, sum_row + 1):
+            ws.cell(row=ri, column=_GRAINGER_OUT_TOTAL).number_format = acct
+        ws.cell(row=sum_row, column=_GRAINGER_OUT_TOTAL).number_format = acct
+
+    end_layout_row = sum_row if sum_row is not None else last_data
+    center = Alignment(horizontal="center", vertical="center")
+    for letter, width in _GRAINGER_COLUMN_WIDTHS.items():
+        ws.column_dimensions[letter].width = width
+    for ri in range(header_row, end_layout_row + 1):
+        ws.cell(row=ri, column=_GRAINGER_OUT_QTY).alignment = center
+
+    _apply_openpyxl_print_file_and_page_footer(ws)
     return _save_xlsx_or_fallback(wb, out_path), review_notes
 
 

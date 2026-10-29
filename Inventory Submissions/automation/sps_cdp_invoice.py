@@ -1,4 +1,4 @@
-"""Run SPS Tractor Supply invoice export on an already-open browser (CDP attach)."""
+"""Run SPS Tractor Supply then Grainger invoice export on an already-open browser (CDP attach)."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def run_tractor_invoice_via_cdp(
     report_day: date | None = None,
     invoice_report_dir: Path | None = None,
 ) -> None:
-    """Tractor Supply invoice flow on the browser at ``cdp_url`` (already signed into SPS)."""
+    """Tractor Supply then Grainger invoice flow on the browser at ``cdp_url`` (already signed into SPS)."""
     inv_dir = (invoice_report_dir or _invoice_report_dir()).resolve()
     if not (inv_dir / "commercehub_invoice_export.py").is_file():
         raise FileNotFoundError(
@@ -54,7 +54,7 @@ def run_tractor_invoice_via_cdp(
         download_dir.mkdir(parents=True, exist_ok=True)
 
         print(
-            f"SPS Tractor Supply invoice report via CDP on {cdp_url} "
+            f"SPS Tractor Supply then Grainger invoice reports via CDP on {cdp_url} "
             f"for {day.isoformat()}…",
             flush=True,
         )
@@ -69,6 +69,6 @@ def run_tractor_invoice_via_cdp(
                 report_day=day,
                 download_dir=download_dir,
             )
-        print("SPS Tractor Supply invoice report complete.", flush=True)
+        print("SPS Tractor Supply and Grainger invoice reports complete.", flush=True)
 
     run_async(_run())

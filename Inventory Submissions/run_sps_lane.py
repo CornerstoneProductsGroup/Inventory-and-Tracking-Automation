@@ -146,7 +146,7 @@ def main() -> int:
                 from automation.sps_cdp_invoice import run_tractor_invoice_via_cdp
 
                 _run_step(
-                    "SPS Tractor Supply invoice report",
+                    "SPS Tractor Supply and Grainger invoice reports",
                     lambda: run_tractor_invoice_via_cdp(cdp_url, report_day=invoice_day),
                 )
 
